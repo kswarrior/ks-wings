@@ -1,7 +1,7 @@
 name: Replace Repo with ks-wings.zip
 
 on:
-  workflow_dispatch: # Manual trigger
+  workflow_dispatch:
 
 jobs:
   replace-repo:
@@ -15,20 +15,25 @@ jobs:
         run: |
           shopt -s extglob
           echo "Deleting all files except .git..."
-          rm -rf !( .git )
+          rm -rf !(.git)
 
       - name: Download ks-wings.zip
         run: |
+          echo "Downloading ks-wings.zip..."
           curl -L -o ks-wings.zip https://github.com/kswarrior/ks-wings/releases/download/main/ks-wings.zip
+          # Verify file is a zip
+          file ks-wings.zip
+          unzip -t ks-wings.zip
 
       - name: Unzip ks-wings.zip into repo root
         run: |
+          echo "Unzipping ks-wings.zip..."
           unzip ks-wings.zip
           # Move files to repo root if zipped folder exists
           FOLDER=$(unzip -Z -1 ks-wings.zip | head -n1 | cut -d/ -f1)
           if [ -d "$FOLDER" ]; then
-            mv $FOLDER/* .
-            rm -rf $FOLDER
+            mv "$FOLDER"/* .
+            rm -rf "$FOLDER"
           fi
           rm ks-wings.zip
 
