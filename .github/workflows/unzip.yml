@@ -15,15 +15,30 @@ jobs:
         run: |
           shopt -s extglob
           echo "Deleting all files except .git..."
-          rm -rf !( .git )
+          rm -rf !(.git)
 
-      - name: Download ks-wings.zip
+      - name: Download latest ks-wings.zip
         run: |
-          curl -L -o ks-wings.zip https://github.com/kswarrior/ks-wings/releases/download/main/ks-wings.zip
+          # Get the latest release ZIP URL automatically
+          ASSET_URL=$(curl -s https://api.github.com/repos/kswarrior/ks-wings/releases/latest \
+            | grep browser_download_url \
+            | grep ks-wings.zip \
+            | cut -d '"' -f 4)
+          echo "Downloading: $ASSET_URL"
+          curl -L -o ks-wings.zip "$ASSET_URL"
+
+      - name: Verify downloaded file
+        run: |
+          file ks-wings.zip
+          if ! file ks-wings.zip | grep -q "Zip archive data"; then
+            echo "Error: ks-wings.zip is not a valid ZIP file"
+            exit 1
+          fi
 
       - name: Unzip ks-wings.zip into repo root
         run: |
           unzip ks-wings.zip
+          # Move all files from the main folder to root
           FOLDER=$(unzip -Z -1 ks-wings.zip | head -n1 | cut -d/ -f1)
           if [ -d "$FOLDER" ]; then
             mv $FOLDER/* .
