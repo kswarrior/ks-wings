@@ -3,6 +3,9 @@ name: Replace Repo with ks-wings.zip
 on:
   workflow_dispatch: # Manual trigger
 
+permissions:
+  contents: write  # Allow workflow to push changes to the repo
+
 jobs:
   replace-repo:
     runs-on: ubuntu-latest
@@ -38,7 +41,7 @@ jobs:
       - name: Unzip ks-wings.zip into repo root
         run: |
           unzip ks-wings.zip
-          # Move all files from the main folder to root
+          # Move all files from the top folder to repo root
           FOLDER=$(unzip -Z -1 ks-wings.zip | head -n1 | cut -d/ -f1)
           if [ -d "$FOLDER" ]; then
             mv $FOLDER/* .
@@ -46,10 +49,11 @@ jobs:
           fi
           rm ks-wings.zip
 
-      - name: Commit and push changes
+      - name: Commit and push changes to your fork
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
+          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/<YOUR_USERNAME>/ks-wings.git
           git add .
           git commit -m "Replace repo files with ks-wings.zip content" || echo "No changes to commit"
           git push
