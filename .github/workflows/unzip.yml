@@ -1,10 +1,7 @@
 name: Download and Extract KS Wings
 
 on:
-  workflow_dispatch:   # Manual run button
-  push:
-    branches:
-      - main           # Also runs when you push to main
+  workflow_dispatch:    # Also runs when you push to main
 
 permissions:
   contents: write      # Required to push files
