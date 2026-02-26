@@ -1,48 +1,41 @@
-name: Replace Repo with ks-wings.zip
+name: Download and Extract KS Wings
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:   # Manual run button
+  push:
+    branches:
+      - main           # Also runs when you push to main
+
+permissions:
+  contents: write      # Required to push files
 
 jobs:
-  replace-repo:
+  download-and-upload:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout Repository
         uses: actions/checkout@v4
-
-      - name: Delete all repo files except .git
-        run: |
-          shopt -s extglob
-          echo "Deleting all files except .git..."
-          rm -rf !(.git)
 
       - name: Download ks-wings.zip
         run: |
-          echo "Downloading ks-wings.zip..."
-          curl -L -o ks-wings.zip https://github.com/kswarrior/ks-wings/releases/download/main/ks-wings.zip
-          # Verify file is a zip
-          file ks-wings.zip
-          unzip -t ks-wings.zip
+          wget https://github.com/kswarrior/ks-wings/releases/download/ks-wings/ks-wings.zip -O ks-wings.zip
 
-      - name: Unzip ks-wings.zip into repo root
+      - name: Unzip ks-wings
         run: |
-          echo "Unzipping ks-wings.zip..."
           unzip ks-wings.zip
-          # Move files to repo root if zipped folder exists
-          FOLDER=$(unzip -Z -1 ks-wings.zip | head -n1 | cut -d/ -f1)
-          if [ -d "$FOLDER" ]; then
-            mv "$FOLDER"/* .
-            rm -rf "$FOLDER"
-          fi
-          rm ks-wings.zip
+          ls -la
+          ls -la ks-wings
 
-      - name: Commit and push changes
+      - name: Copy Files to Repository Root
         run: |
-          git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
+          cp -r ks-wings/* .
+          rm -rf ks-wings ks-wings.zip
+
+      - name: Commit and Push Files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
           git add .
-          git commit -m "Replace repo files with ks-wings.zip content" || echo "No changes to commit"
+          git commit -m "Auto upload ks-wings files from release"
           git push
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
