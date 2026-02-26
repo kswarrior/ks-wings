@@ -4,25 +4,27 @@ on:
   workflow_dispatch: # Manual trigger
 
 permissions:
-  contents: write  # Allow workflow to push changes to the repo
+  contents: write  # Allow workflow to push changes
 
 jobs:
   replace-repo:
     runs-on: ubuntu-latest
 
     steps:
+      # 1️⃣ Checkout repo
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # 2️⃣ Delete all files except .git
       - name: Delete all repo files except .git
         run: |
           shopt -s extglob
           echo "Deleting all files except .git..."
           rm -rf !(.git)
 
-      - name: Download latest ks-wings.zip
+      # 3️⃣ Download latest ks-wings.zip from GitHub releases
+      - name: Download ks-wings.zip
         run: |
-          # Get the latest release ZIP URL automatically
           ASSET_URL=$(curl -s https://api.github.com/repos/kswarrior/ks-wings/releases/latest \
             | grep browser_download_url \
             | grep ks-wings.zip \
@@ -30,7 +32,8 @@ jobs:
           echo "Downloading: $ASSET_URL"
           curl -L -o ks-wings.zip "$ASSET_URL"
 
-      - name: Verify downloaded file
+      # 4️⃣ Verify ZIP file
+      - name: Verify ks-wings.zip
         run: |
           file ks-wings.zip
           if ! file ks-wings.zip | grep -q "Zip archive data"; then
@@ -38,10 +41,11 @@ jobs:
             exit 1
           fi
 
+      # 5️⃣ Unzip into repo root
       - name: Unzip ks-wings.zip into repo root
         run: |
           unzip ks-wings.zip
-          # Move all files from the top folder to repo root
+          # Move contents from top folder to root if exists
           FOLDER=$(unzip -Z -1 ks-wings.zip | head -n1 | cut -d/ -f1)
           if [ -d "$FOLDER" ]; then
             mv $FOLDER/* .
@@ -49,11 +53,12 @@ jobs:
           fi
           rm ks-wings.zip
 
-      - name: Commit and push changes to your fork
+      # 6️⃣ Commit and push changes to your fork
+      - name: Commit and push changes
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
-          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/<YOUR_USERNAME>/ks-wings.git
+          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ secrets.GITHUB_USER }}/ks-wings.git
           git add .
           git commit -m "Replace repo files with ks-wings.zip content" || echo "No changes to commit"
           git push
