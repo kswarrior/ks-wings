@@ -1,0 +1,42 @@
+name: Replace Repo with ks-wings.zip
+
+on:
+  workflow_dispatch: # Manual trigger
+
+jobs:
+  replace-repo:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Delete all repo files except .git
+        run: |
+          shopt -s extglob
+          echo "Deleting all files except .git..."
+          rm -rf !( .git )
+
+      - name: Download ks-wings.zip
+        run: |
+          curl -L -o ks-wings.zip https://github.com/kswarrior/ks-wings/releases/download/main/ks-wings.zip
+
+      - name: Unzip ks-wings.zip into repo root
+        run: |
+          unzip ks-wings.zip
+          FOLDER=$(unzip -Z -1 ks-wings.zip | head -n1 | cut -d/ -f1)
+          if [ -d "$FOLDER" ]; then
+            mv $FOLDER/* .
+            rm -rf $FOLDER
+          fi
+          rm ks-wings.zip
+
+      - name: Commit and push changes
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add .
+          git commit -m "Replace repo files with ks-wings.zip content" || echo "No changes to commit"
+          git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
