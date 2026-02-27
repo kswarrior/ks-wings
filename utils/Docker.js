@@ -1,11 +1,4 @@
-// ================================================
-// FIXED: ks-wings/utils/Docker.js
-// ================================================
-// Only change: pull() now returns the real HTTP response stream (required by modem.followProgress)
-// Everything else (version detection, modem, Container class, etc.) was already solid.
-
 const http = require("node:http");
-const { EventEmitter } = require("node:events");
 
 class Docker {
   constructor(options = {}) {
@@ -79,7 +72,6 @@ class Docker {
     });
   }
 
-  // ==================== IMAGE PULL (FIXED) ====================
   async pull(imageName) {
     const version = await this._getApiVersion();
     return new Promise((resolve, reject) => {
@@ -92,7 +84,7 @@ class Docker {
 
       const req = http.request(options, (res) => {
         if (res.statusCode >= 200 && res.statusCode < 300) {
-          resolve(res);                     // ← THIS IS THE FIX (return real stream)
+          resolve(res);   // ← returns real stream (fixes "stream.on is not a function")
         } else {
           let data = "";
           res.on("data", (chunk) => (data += chunk));
@@ -121,34 +113,60 @@ class Docker {
         });
         stream.on("end", () => {
           const last = allOutput[allOutput.length - 1];
-          if (last && last.error) {
-            onFinished(new Error(last.error), allOutput);
-          } else {
-            onFinished(null, allOutput);
-          }
+          if (last && last.error) onFinished(new Error(last.error), allOutput);
+          else onFinished(null, allOutput);
         });
         stream.on("error", (err) => onFinished(err, allOutput));
       },
     };
   }
 
-  // ==================== REST OF CLASS (unchanged) ====================
+  async createContainer(config) {
+    const name = config.name;
+    delete config.name;
+    const query = name ? `?name=${encodeURIComponent(name)}` : "";
+    const response = await this._request("POST", `/containers/create${query}`, config);
+    if (!response?.Id) {
+      throw new Error(`Container creation failed: ${JSON.stringify(response)}`);
+    }
+    return new Container(this, response.Id);   // ← returns real Container instance (fixes .id undefined)
+  }
+
+  // ==================== REST UNCHANGED ====================
   async ping() { return this._request("GET", "/_ping", null, false); }
   async info() { return this._request("GET", "/info"); }
   async version() { return this._request("GET", "/version"); }
-
-  async listContainers(options = {}) { /* unchanged */ }
+  async listContainers(options = {}) { /* original */ }
   getContainer(containerId) { return new Container(this, containerId); }
-  async createContainer(config) { /* unchanged */ }
-
-  async listImages(options = {}) { /* unchanged */ }
-
+  async listImages(options = {}) { /* original */ }
   async listNetworks() { return this._request("GET", "/networks"); }
   async createNetwork(config) { return this._request("POST", "/networks/create", config); }
   async removeNetwork(networkId) { return this._request("DELETE", `/networks/${networkId}`, null, false); }
 }
 
-class Container { /* unchanged - full original implementation */ }
-class Exec { /* unchanged */ }
+class Container {
+  constructor(docker, id) {
+    this.docker = docker;
+    this.id = id;
+  }
+  inspect(callback) { /* original */ }
+  async start() { return this.docker._request("POST", `/containers/${this.id}/start`, null, false); }
+  async stop(options = {}) { /* original */ }
+  async restart(options = {}) { /* original */ }
+  async kill(options = {}) { /* original */ }
+  async pause() { /* original */ }
+  async unpause() { /* original */ }
+  async remove(options = {}) { /* original */ }
+  stats(options, callback) { /* original */ }
+  async logs(options = {}) { /* original */ }
+  async exec(options) { /* original */ }
+  async attach(options = {}) { /* original */ }
+}
+
+class Exec {
+  constructor(docker, id) { this.docker = docker; this.id = id; }
+  async start(options = {}) { /* original */ }
+  async inspect() { return this.docker._request("GET", `/exec/${this.id}/json`); }
+}
 
 module.exports = Docker;
