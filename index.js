@@ -302,20 +302,12 @@ function initializeWebSocketServer(server) {
         });
       }
 
-      let logStream;
-
-try {
-  logStream = await container.logs({
-    follow: true,
-    stdout: true,
-    stderr: true,
-    tail: 0,
-  });
-} catch (err) {
-  log.error("Failed to attach logs:", err.message);
-  ws.send(`\r\n\u001b[31m[kswings]\x1b[0m Log attach failed: ${err.message}\r\n`);
-  return;
-}
+      const logStream = await container.logs({
+        follow: true,
+        stdout: true,
+        stderr: true,
+        tail: 0, // Start streaming logs immediately
+      });
 
       logStream.on("data", (chunk) => {
         const logMessage = {
@@ -548,33 +540,25 @@ try {
       }
     }
 
-    function calculateDirectorySize(directoryPath, currentDepth = 0) {
-  if (currentDepth >= 20) {
-    log.warn(`Maximum depth reached at ${directoryPath}`);
-    return 0;
-  }
+    function calculateDirectorySize(directoryPath, currentDepth) {
+      if (currentDepth >= 500) {
+        log.warn(`Maximum depth reached at ${directoryPath}`);
+        return 0;
+      }
 
-  let totalSize = 0;
-
-  if (!fs.existsSync(directoryPath)) {
-    return 0;
-  }
-
-  const files = fs.readdirSync(directoryPath);
-
-  for (const file of files) {
-    const filePath = path.join(directoryPath, file);
-    const stats = fs.statSync(filePath);
-
-    if (stats.isDirectory()) {
-      totalSize += calculateDirectorySize(filePath, currentDepth + 1);
-    } else {
-      totalSize += stats.size;
+      let totalSize = 0;
+      const files = fs.readdirSync(directoryPath);
+      for (const file of files) {
+        const filePath = path.join(directoryPath, file);
+        const stats = fs.statSync(filePath);
+        if (stats.isDirectory()) {
+          totalSize += calculateDirectorySize(filePath, currentDepth + 1);
+        } else {
+          totalSize += stats.size;
+        }
+      }
+      return totalSize;
     }
-  }
-
-  return totalSize;
-}
 
     // fixed in 0.2.2 sam
     function formatBytes(bytes) {
