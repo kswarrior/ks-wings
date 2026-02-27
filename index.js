@@ -290,56 +290,98 @@ function initializeWebSocketServer(server) {
     }
 
     async function streamDockerLogs(ws, container) {
-      const containerId = container.id;
+  const containerId = container.id;
 
-      if (!containerLogs[containerId]) {
-        initializeContainerLogs(containerId);
+  // Ensure log memory exists
+  if (!containerLogs[containerId]) {
+    initializeContainerLogs(containerId);
+  }
+
+  // Send cached logs first
+  if (containerLogs[containerId].length > 0) {
+    for (const logMessage of containerLogs[containerId]) {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(formatLogMessage(logMessage));
       }
+    }
+  }
 
-      if (containerLogs[containerId].length > 0) {
-        containerLogs[containerId].forEach((logMessage) => {
-          ws.send(formatLogMessage(logMessage));
-        });
-      }
+  let logStream;
 
-      const logStream = await container.logs({
-        follow: true,
-        stdout: true,
-        stderr: true,
-        tail: 0, // Start streaming logs immediately
-      });
-
-      logStream.on("data", (chunk) => {
-        const logMessage = {
-          timestamp: new Date().toISOString(),
-          content: chunk.toString(),
-        };
-
-        containerLogs[containerId].push(logMessage);
-
-        const formattedMessage = formatLogMessage(logMessage);
-        
-        // Rate limit check - only send if WebSocket is not buffering
-        if (ws.bufferedAmount === 0) {
-          ws.send(formattedMessage);
-        }
-      });
-
-      ws.on("close", () => {
-        logStream.destroy();
-        log.info("WebSocket client disconnected");
-      });
+  try {
+    // Make sure container is running before attaching logs
+    const info = await container.inspect();
+    if (!info?.State?.Running) {
+      log.warn(`Container ${containerId} is not running. Skipping log attach.`);
+      return;
     }
 
-    // Helper function to format log messages
-    const formatLogMessage = (logMessage) => {
-      const { content } = logMessage;
-      return content
-        .split('\n')
-        .filter(line => line.length > 0)
-        .map(line => `\r\n\u001b[34m[docker] \x1b[0m${line}\r\n`)
-        .join('');
-    };
+    logStream = await container.logs({
+      follow: true,
+      stdout: true,
+      stderr: true,
+      tail: 0,
+    });
+
+    if (!logStream || typeof logStream.on !== "function") {
+      throw new Error("Invalid log stream returned from Docker");
+    }
+
+  } catch (err) {
+    log.error(`Failed to initialize log stream for ${containerId}: ${err.message}`);
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(
+        `\r\n\u001b[31m[kswings] \x1b[0mFailed to attach to container logs.\r\n`
+      );
+    }
+    return; // Prevent crash
+  }
+
+  // Handle incoming log data
+  logStream.on("data", (chunk) => {
+    try {
+      const logMessage = {
+        timestamp: new Date().toISOString(),
+        content: chunk.toString(),
+      };
+
+      containerLogs[containerId].push(logMessage);
+
+      const formattedMessage = formatLogMessage(logMessage);
+
+      if (
+        ws.readyState === WebSocket.OPEN &&
+        ws.bufferedAmount === 0
+      ) {
+        ws.send(formattedMessage);
+      }
+
+    } catch (err) {
+      log.error("Error processing log chunk:", err.message);
+    }
+  });
+
+  // Handle Docker stream errors safely
+  logStream.on("error", (err) => {
+    log.error(`Docker log stream error for ${containerId}: ${err.message}`);
+  });
+
+  logStream.on("end", () => {
+    log.info(`Log stream ended for ${containerId}`);
+  });
+
+  // Handle WebSocket close safely
+  ws.on("close", () => {
+    try {
+      if (logStream && !logStream.destroyed) {
+        logStream.destroy();
+      }
+    } catch (err) {
+      log.warn("Error destroying log stream:", err.message);
+    }
+    log.info("WebSocket client disconnected");
+  });
+}
 
     async function setupExecSession(ws, container) {
       streamDockerLogs(ws, container);
