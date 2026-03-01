@@ -96,7 +96,6 @@ startLoggingStats();
 
 app.get("/stats", async (req, res) => {
   log.debug('Stats endpoint called');  // ADD: As requested
-
   try {
     const totalStats = statsLogger.getSystemStats.total();
     const containers = await docker.listContainers({ all: true });
