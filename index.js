@@ -95,7 +95,6 @@ async function startLoggingStats() {
 startLoggingStats();
 
 app.get("/stats", async (req, res) => {
-  log.debug('Stats endpoint called');  // ADD: As requested
   try {
     const totalStats = statsLogger.getSystemStats.total();
     const containers = await docker.listContainers({ all: true });
@@ -127,7 +126,7 @@ app.get("/stats", async (req, res) => {
 
     res.json(responseStats);
   } catch (error) {
-    log.error("Error fetching stats:", error);
+    console.error("Error fetching stats:", error);
     res.status(500).json({ error: "Failed to fetch stats" });
   }
 });
@@ -417,32 +416,269 @@ function initializeWebSocketServer(server) {
           if (storageExceeded && !hasAutoStopped) {
             const containerInfo = await container.inspect();
             if (containerInfo.State.Running) {
-              log.warn(`Storage exceeded for container ${container.id} - auto-stopping`);
-              await container.stop();
+              log.warn(`Storage limit exceeded for volume ${volumeId}. Auto-stopping container.`);
               hasAutoStopped = true;
+              try {
+                await container.stop();
+                ws.send(`\r\n\u001b[31m[kswings] \x1b[0mServer stopped: storage limit exceeded (${volumeSizeMiB.toFixed(2)} MiB / ${diskLimit} MiB). Delete files or increase limit.\r\n`);
+              } catch (stopErr) {
+                log.error("Failed to auto-stop container:", stopErr.message);
+              }
             }
           }
 
           ws.send(JSON.stringify(stats));
-        } catch (err) {
-          log.error(`Failed to fetch stats for container ${container.id}:`, err.message);
-          if (ws.readyState === ws.OPEN) {
-            ws.send(JSON.stringify({ error: 'Failed to fetch stats' }));
-          }
+        } catch (error) {
+          ws.send(JSON.stringify({ error: error.message }));
         }
       };
 
-      const statsInterval = setInterval(fetchStats, 1000);
+      await fetchStats();
 
-      ws.on('close', () => {
+      const statsInterval = setInterval(fetchStats, 2000);
+
+      ws.on("close", () => {
         clearInterval(statsInterval);
+        log.info("WebSocket client disconnected");
       });
+    }
+
+    async function executeCommand(ws, container, command) {
+      try {
+        const stream = await container.attach({
+          stream: true,
+          stdin: true,
+          stdout: true,
+          stderr: false, // doesn't use stderr
+          hijack: true,
+        });
+
+        // Collect output and send it back via WebSocket
+        stream.on("data", (chunk) => {
+          //ws.send(chunk.toString('utf8'));
+        });
+
+        stream.on("end", () => {
+          log.info("Attach stream ended");
+          //ws.send('\nCommand execution completed');
+        });
+
+        stream.on("error", (err) => {
+          log.error("Attach stream error:", err);
+          ws.send(`Error in attach stream: ${err.message}`);
+        });
+
+        //log.info('Executing command:', command);
+        stream.write(command + "\n");
+
+        // Detach after sending the command to ensure proper execution
+        stream.end();
+      } catch (err) {
+        log.error("Failed to attach to container:", err);
+        ws.send(`Failed to attach to container: ${err.message}`);
+      }
+    }
+
+    async function performPowerAction(ws, container, action) {
+  const actionMap = {
+    start: container.start.bind(container),
+    stop: container.kill.bind(container),
+    restart: container.restart.bind(container),
+  };
+
+  if (!actionMap[action]) {
+    ws.send(
+      `\r\n\u001b[33m[kswings] \x1b[0mInvalid action: ${action}\r\n`
+    );
+    return;
+  }
+
+  const containerId = container.id;
+
+  // ✅ Check storage limit before start/restart
+  if (action === "start" || action === "restart") {
+    try {
+      const containerInfo = await container.inspect();
+
+      // 🔥 FIX: Detect bind mount properly instead of using containerInfo.Name
+      const dataMount = containerInfo.Mounts.find(
+        (m) => m.Type === "bind" && m.Destination === "/app/data"
+      );
+
+      if (!dataMount) {
+        log.warn("No bind mount found for /app/data - skipping storage check");
+      } else {
+        const volumePath = dataMount.Source; // Full host path
+        const volumeId = path.basename(volumePath);
+
+        const statesFilePath = path.join(__dirname, "storage/states.json");
+
+        if (fs.existsSync(statesFilePath)) {
+          const statesData = JSON.parse(
+            fs.readFileSync(statesFilePath, "utf8")
+          );
+
+          if (
+            statesData[volumeId] &&
+            statesData[volumeId].diskLimit > 0
+          ) {
+            const volumeSize = await getVolumeSize(volumeId);
+            const volumeSizeMiB = parseFloat(volumeSize) || 0;
+
+            if (
+              volumeSizeMiB >= statesData[volumeId].diskLimit
+            ) {
+              ws.send(
+                `\r\n\u001b[31m[kswings] \x1b[0mCannot ${action}: storage limit exceeded (${volumeSizeMiB.toFixed(
+                  2
+                )} MiB / ${
+                  statesData[volumeId].diskLimit
+                } MiB). Delete files or increase your disk limit.\r\n`
+              );
+              return;
+            }
+          }
+        }
+      }
+    } catch (checkErr) {
+      log.warn(
+        "Failed to check storage limit for power action:",
+        checkErr.message
+      );
+    }
+  }
+
+  const timestamp = new Date().toISOString();
+  const message = {
+    timestamp: timestamp,
+    content: `\r\n\u001b[33m[kswings] \x1b[0mWorking on ${action}...\r\n`,
+  };
+
+  ws.send(message.content);
+
+  try {
+    if (action === "restart" || action === "stop") {
+      containerLogs[containerId] = [];
+    }
+
+    // 🔥 Keep log streaming BEFORE action (important for startup logs)
+    streamDockerLogs(ws, container);
+
+    await actionMap[action]();
+
+    const successMessage = {
+      timestamp: new Date().toISOString(),
+      content: `\r\n\u001b[32m[kswings] \x1b[0m${
+        action.charAt(0).toUpperCase() + action.slice(1)
+      } action completed.\r\n`,
+    };
+
+    ws.send(successMessage.content);
+  } catch (err) {
+    log.error(`Error performing ${action} action:`, err.message);
+
+    const errorMessage = {
+      timestamp: new Date().toISOString(),
+      content: `\r\n\u001b[31m[kswings] \x1b[0mAction failed: ${err.message}\r\n`,
+    };
+
+    ws.send(errorMessage.content);
+  }
+}
+
+    async function getVolumeSize(volumeId) {
+      const volumePath = path.join("./volumes", volumeId);
+      try {
+        const totalSize = await calculateDirectorySize(volumePath);
+        // Return size in MiB as a number for easier frontend processing
+        return (totalSize / (1024 * 1024)).toFixed(2);
+      } catch (err) {
+        return "0";
+      }
+    }
+
+    function calculateDirectorySize(directoryPath, currentDepth) {
+      if (currentDepth >= 500) {
+        log.warn(`Maximum depth reached at ${directoryPath}`);
+        return 0;
+      }
+
+      let totalSize = 0;
+      const files = fs.readdirSync(directoryPath);
+      for (const file of files) {
+        const filePath = path.join(directoryPath, file);
+        const stats = fs.statSync(filePath);
+        if (stats.isDirectory()) {
+          totalSize += calculateDirectorySize(filePath, currentDepth + 1);
+        } else {
+          totalSize += stats.size;
+        }
+      }
+      return totalSize;
+    }
+
+    // fixed in 0.2.2 sam
+    function formatBytes(bytes) {
+      if (bytes === 0) return "0 Bytes";
+      const k = 1024;
+      const sizes = ["Bytes", "KB", "MB", "GB", "TB"];
+      const i = Math.floor(Math.log(bytes) / Math.log(k));
+      return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
     }
   });
 }
 
+// Start the websocket server
 initializeWebSocketServer(server);
 
-server.listen(config.port, () => {
-  log.info(`KS Wings listening on port ${config.port}`);
+/**
+ * Default HTTP GET route that provides basic daemon status information including Docker connectivity
+ * and system info. It performs a health check on Docker to ensure it's running and accessible, returning
+ * the daemon's status and any pertinent Docker system information in the response.
+ */
+app.get("/", async (req, res) => {
+  try {
+    const dockerInfo = await docker.info(); // Fetches information about the docker
+    const isDockerRunning = await docker.ping(); // Checks if the docker is up (which it probably is or this will err)
+
+    // Prepare the response object with Docker status
+    const response = {
+      versionFamily: 1,
+      versionRelease: "kswings " + config.version,
+      online: true,
+      remote: config.remote,
+      mysql: {
+        host: config.mysql.host,
+        user: config.mysql.user,
+        password: config.mysql.password,
+      },
+      docker: {
+        status: isDockerRunning ? "running" : "not running", // uhm, should keep it or not idk
+        systemInfo: dockerInfo,
+      },
+    };
+
+    res.json(response); // the point of this? just use the ws - yeah conn to the ws on nodes page and send that json over ws
+  } catch (error) {
+    log.error("Error fetching Docker status:", error);
+    res.status(500).json({
+      error: "Docker is not running - kswings will not function properly.",
+    });
+  }
 });
+
+app.use((err, req, res, next) => {
+  log.error(err.stack);
+  res.status(500).send("Something has... gone wrong!");
+});
+
+/**
+ * Starts the HTTP server with WebSocket support after a short delay, listening on the configured port.
+ * Logs a startup message indicating successful listening. This delayed start allows for any necessary
+ * initializations to complete before accepting incoming connections.
+ */
+setTimeout(function () {
+  server.listen(config.port, () =>
+    log.info(`kswings is listening on port ${config.port}`)
+  );
+}, 2000);
