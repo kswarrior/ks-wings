@@ -1,4 +1,4 @@
-name: Run KS Wings
+name: Run KS Wings t
 
 on:
   workflow_dispatch:
