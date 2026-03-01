@@ -95,6 +95,8 @@ async function startLoggingStats() {
 startLoggingStats();
 
 app.get("/stats", async (req, res) => {
+  log.debug('Stats endpoint called');  // ADD: Debug log for endpoint call
+
   try {
     const totalStats = statsLogger.getSystemStats.total();
     const containers = await docker.listContainers({ all: true });
@@ -126,7 +128,7 @@ app.get("/stats", async (req, res) => {
 
     res.json(responseStats);
   } catch (error) {
-    console.error("Error fetching stats:", error);
+    log.error("Error fetching stats:", error);
     res.status(500).json({ error: "Failed to fetch stats" });
   }
 });
@@ -416,30 +418,25 @@ function initializeWebSocketServer(server) {
           if (storageExceeded && !hasAutoStopped) {
             const containerInfo = await container.inspect();
             if (containerInfo.State.Running) {
-              log.warn(`Storage limit exceeded for volume ${volumeId}. Auto-stopping container.`);
+              log.warn(`Storage exceeded for container ${container.id} - auto-stopping`);
+              await container.stop();
               hasAutoStopped = true;
-              try {
-                await container.stop();
-                ws.send(`\r\n\u001b[31m[kswings] \x1b[0mServer stopped: storage limit exceeded (${volumeSizeMiB.toFixed(2)} MiB / ${diskLimit} MiB). Delete files or increase limit.\r\n`);
-              } catch (stopErr) {
-                log.error("Failed to auto-stop container:", stopErr.message);
-              }
             }
           }
 
           ws.send(JSON.stringify(stats));
-        } catch (error) {
-          ws.send(JSON.stringify({ error: error.message }));
+        } catch (err) {
+          log.error(`Failed to fetch stats for container ${container.id}:`, err.message);
+          if (ws.readyState === ws.OPEN) {
+            ws.send(JSON.stringify({ error: 'Failed to fetch stats' }));
+          }
         }
       };
 
-      await fetchStats();
+      const statsInterval = setInterval(fetchStats, 1000);
 
-      const statsInterval = setInterval(fetchStats, 2000);
-
-      ws.on("close", () => {
+      ws.on('close', () => {
         clearInterval(statsInterval);
-        log.info("WebSocket client disconnected");
       });
     }
 
@@ -533,7 +530,7 @@ function initializeWebSocketServer(server) {
                   2
                 )} MiB / ${
                   statesData[volumeId].diskLimit
-                } MiB). Delete files or increase your disk limit.\r\n`
+                } MiB). Delete files or increase limit.\r\n`
               );
               return;
             }
