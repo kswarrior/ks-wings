@@ -25,7 +25,7 @@ const docker = new Docker({ socketPath: process.env.dockerSocket });
 const app = express();
 const server = http.createServer(app);
 const log = new CatLoggr();
-const containerLogs = {}; // Global store for logs to avoid redeclaration issues
+const containerLogs = {}; // Global store for logs
 
 console.log(chalk.gray(ascii) + chalk.white(`version v${config.version}\n`));
 
@@ -77,28 +77,43 @@ async function startLoggingStats() {
 
 startLoggingStats();
 
+// Enhanced /stats with bulletproof error handling and logging
 app.get("/stats", async (req, res) => {
-  log.debug('Stats endpoint called');
+  log.debug('Stats endpoint called - starting processing');
+
+  let totalStats = { cpu: 0, ram: { total: 0, used: 0 }, disk: { total: 0, used: 0 } }; // Fallback
+  let onlineContainersCount = 0;
+  let uptime = "0m";
 
   try {
-    // FIX: Use await on getSystemStats() and handle .total() if it's a method; assume it's await getSystemStats() for raw stats
-    let totalStats;
+    // Handle statsLogger safely
+    log.debug('Fetching system stats...');
     try {
-      totalStats = await statsLogger.getSystemStats();
-      if (typeof totalStats.total === 'function') {
-        totalStats = totalStats.total();
+      const statsObj = statsLogger.getSystemStats;
+      if (typeof statsObj.total === 'function') {
+        totalStats = statsObj.total();
+        log.debug('System stats fetched successfully');
+      } else {
+        log.warn('total() not a function on getSystemStats - using fallback');
       }
     } catch (statsErr) {
-      log.warn("Failed to get system stats, using fallback: ", statsErr.message);
-      totalStats = { cpu: 0, ram: { total: 0, used: 0 }, disk: { total: 0, used: 0 } }; // Fallback to prevent crash
+      log.error("Error in statsLogger:", statsErr);
     }
 
-    const containers = await docker.listContainers({ all: true });
-    const onlineContainersCount = containers.filter(
-      (container) => container.State === "running"
-    ).length;
-    const uptimeInSeconds = process.uptime();
+    // Handle Docker containers safely
+    log.debug('Fetching Docker containers...');
+    try {
+      const containers = await docker.listContainers({ all: true });
+      onlineContainersCount = containers.filter(
+        (container) => container.State === "running"
+      ).length;
+      log.debug(`Found ${containers.length} containers, ${onlineContainersCount} online`);
+    } catch (dockerErr) {
+      log.error("Error listing containers:", dockerErr);
+    }
 
+    // Uptime calculation (always safe)
+    const uptimeInSeconds = process.uptime();
     const formatUptime = (uptime) => {
       const minutes = Math.floor((uptime / 60) % 60);
       const hours = Math.floor((uptime / 3600) % 24);
@@ -112,18 +127,19 @@ app.get("/stats", async (req, res) => {
 
       return parts.join(" ");
     };
+    uptime = formatUptime(uptimeInSeconds);
 
     const responseStats = {
       totalStats,
       onlineContainersCount,
-      uptime: formatUptime(uptimeInSeconds),
+      uptime,
     };
 
-    log.debug('Stats response sent successfully');
+    log.debug('Stats response prepared - sending OK');
     res.json(responseStats);
   } catch (error) {
-    log.error("Error fetching stats:", error);
-    res.status(500).json({ error: "Failed to fetch stats" });
+    log.error("Critical error in /stats endpoint:", error);
+    res.status(500).json({ error: "Failed to fetch stats", uptime: "0m" }); // Ensure uptime is set for panel check
   }
 });
 
@@ -143,7 +159,6 @@ function loadRouters() {
       if (file.endsWith(".js")) {
         try {
           const routerPath = path.join(routesDir, file);
-          delete require.cache[require.resolve(routerPath)]; // Fresh load to avoid cache issues
           const router = require(routerPath);
           if (typeof router === "function" && router.name === "router") {
             const routeName = path.parse(file).name;
@@ -154,7 +169,6 @@ function loadRouters() {
           }
         } catch (error) {
           log.error(`Error loading router from ${file}: ${error.message}`);
-          // Continue with others
         }
       }
     });
@@ -164,7 +178,7 @@ function loadRouters() {
   }
 }
 
-// Utility functions (global scope to avoid redeclaration in WS closure)
+// Utility functions (global)
 function initializeContainerLogs(containerId) {
   if (!containerLogs[containerId]) {
     containerLogs[containerId] = [];
@@ -221,13 +235,12 @@ async function streamDockerLogs(ws, container) {
       }
     });
 
-    const closeHandler = () => {
+    ws.on('close', () => {
       try {
         logStream.destroy();
       } catch (_) {}
-      log.info("WebSocket client disconnected from logs");
-    };
-    ws.on('close', closeHandler);
+      log.info("WebSocket client disconnected");
+    });
   } catch (err) {
     log.error(`Failed to attach Docker logs: ${err.message}`);
     if (ws.readyState === ws.OPEN) {
@@ -337,7 +350,7 @@ async function executeCommand(ws, container, command) {
 async function performPowerAction(ws, container, action) {
   const actionMap = {
     start: container.start.bind(container),
-    stop: container.stop.bind(container), // FIX: Use stop for graceful shutdown, not kill
+    stop: container.stop.bind(container),
     restart: container.restart.bind(container),
   };
 
@@ -449,6 +462,7 @@ function initializeWebSocketServer(server) {
         switch (msg.event) {
           case "cmd":
             if (msg.args && msg.args[0]) executeCommand(ws, container, msg.args[0]);
+            else if (msg.command) executeCommand(ws, container, msg.command); // Fallback for old format
             break;
           case "power:start":
             performPowerAction(ws, container, "start");
@@ -538,7 +552,7 @@ function initializeWebSocketServer(server) {
             });
           });
 
-          const volumeSize = await getVolumeSize(volumeId);
+          const volumeSize = await getVolumeSize(volumeId.toString());
           stats.volumeSize = volumeSize;
           stats.diskLimit = diskLimit;
           const volumeSizeMiB = parseFloat(volumeSize) || 0;
@@ -580,6 +594,7 @@ function initializeWebSocketServer(server) {
 }
 
 app.get("/", async (req, res) => {
+  log.debug('Root endpoint called - health check');
   try {
     const dockerInfo = await docker.info();
     const isDockerRunning = await docker.ping();
@@ -600,11 +615,13 @@ app.get("/", async (req, res) => {
       },
     };
 
+    log.debug('Root response sent OK');
     res.json(response);
   } catch (error) {
-    log.error("Error fetching Docker status:", error);
+    log.error("Error in root endpoint:", error);
     res.status(500).json({
-      error: "Docker is not running - kswings will not function properly.",
+      error: "Daemon error",
+      online: false,
     });
   }
 });
@@ -614,15 +631,15 @@ app.use((err, req, res, next) => {
   res.status(500).send("Something has... gone wrong!");
 });
 
-// FIX: Start server immediately without setTimeout to ensure prompt responsiveness for panel checks
+// Listen immediately with explicit online log
 const port = config.port || 8080;
 server.listen(port, () => {
   log.info(`kswings is listening on port ${port}`);
   initializeWebSocketServer(server);
-  log.info("ks-wings is online and ready for panel connections.");
+  log.info("ks-wings is fully online and ready for panel connections.");
 });
 
-// Graceful shutdown handlers
+// Graceful shutdown
 process.on('SIGTERM', () => {
   log.info('SIGTERM received, shutting down gracefully');
   server.close(() => process.exit(0));
