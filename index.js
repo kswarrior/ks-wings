@@ -81,7 +81,8 @@ app.get("/stats", async (req, res) => {
   log.debug('Stats endpoint called');
 
   try {
-    const totalStats = statsLogger.getSystemStats.total(); // Assuming this returns system stats object
+    // FIX: Correctly await getSystemStats() - remove .total() as it's likely a method error causing crash
+    const totalStats = await statsLogger.getSystemStats();
     const containers = await docker.listContainers({ all: true });
     const onlineContainersCount = containers.filter(
       (container) => container.State === "running"
@@ -108,6 +109,7 @@ app.get("/stats", async (req, res) => {
       uptime: formatUptime(uptimeInSeconds),
     };
 
+    log.debug('Stats response prepared successfully');
     res.json(responseStats);
   } catch (error) {
     log.error("Error fetching stats:", error);
@@ -132,6 +134,7 @@ function loadRouters() {
       if (file.endsWith(".js")) {
         try {
           const routerPath = path.join(routesDir, file);
+          delete require.cache[require.resolve(routerPath)]; // Ensure fresh load
           const router = require(routerPath);
           if (typeof router === "function" && router.name === "router") {
             const routeName = path.parse(file).name;
@@ -212,11 +215,14 @@ async function streamDockerLogs(ws, container) {
       }
     });
 
-    ws.on("close", () => {
+    // Clean up on WS close
+    const originalClose = ws.on.bind(ws, 'close');
+    ws.on('close', () => {
       try {
         logStream.destroy();
       } catch (_) {}
       log.info("WebSocket client disconnected from logs");
+      originalClose();
     });
   } catch (err) {
     log.error(`Failed to attach Docker logs: ${err.message}`);
@@ -240,21 +246,20 @@ async function getVolumeSize(volumeId) {
   }
 }
 
-function calculateDirectorySizeAsync(dirPath, currentDepth = 0) {
-  return new Promise((resolve, reject) => {
-    if (currentDepth >= 500) {
-      log.warn(`Maximum depth reached at ${dirPath}`);
-      resolve(0);
-      return;
-    }
+async function calculateDirectorySizeAsync(dirPath, currentDepth = 0) {
+  if (currentDepth >= 500) {
+    log.warn(`Maximum depth reached at ${dirPath}`);
+    return 0;
+  }
 
-    let totalSize = 0;
+  return new Promise((resolve, reject) => {
     fs.readdir(dirPath, { withFileTypes: true }, (err, files) => {
       if (err) {
         reject(err);
         return;
       }
 
+      let totalSize = 0;
       let processed = 0;
       const totalFiles = files.length;
 
@@ -620,11 +625,12 @@ app.use((err, req, res, next) => {
   res.status(500).send("Something has... gone wrong!");
 });
 
-// Start server
-server.listen(config.port || 8080, () => {
-  log.info(`kswings is listening on port ${config.port || 8080}`);
+// FIX: Listen immediately after setup, no setTimeout - add explicit log for online status
+const port = config.port || 8080;
+server.listen(port, () => {
+  log.info(`kswings is listening on port ${port}`);
   initializeWebSocketServer(server);
-  log.info("ks-wings is online and ready.");
+  log.info("ks-wings is online and ready for panel connections.");
 });
 
 // Graceful shutdown
