@@ -489,7 +489,7 @@ const getContainerState = async (req, res) => {
   }
 };
 
-router.post("/admin/instances/create", createContainer);
+router.post("/instances/create", createContainer);
 router.delete("/instances/:id", deleteContainer);
 router.post("/instances/redeploy/:id/:Idd", redeployContainer);
 router.post("/instances/reinstall/:id/:Idd", reinstallContainer);
