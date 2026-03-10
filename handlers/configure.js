@@ -74,7 +74,7 @@ async function configureNode() {
   const newAccessKey = generateAccessKey();
 
   // Prepare the configuration request
-  const configureUrl = new URL("/nodes/configure", options.panel);
+  const configureUrl = new URL("/admin/nodes/configure", options.panel);
   configureUrl.searchParams.append("authKey", config.key); // Use existing key as authKey
   configureUrl.searchParams.append("configureKey", options.key);
   configureUrl.searchParams.append("accessKey", newAccessKey);
