@@ -113,25 +113,44 @@ const replaceVariables = async (dir, variables) => {
 
 const objectToEnv = (obj) => Object.entries(obj).map(([key, value]) => `${key}=${value}`);
 
-const createContainerOptions = (config, volumePath) => ({
-  name: config.Id,
-  Image: config.Image,
-  ExposedPorts: config.Ports,
-  AttachStdout: true,
-  AttachStderr: true,
-  AttachStdin: true,
-  Tty: true,
-  OpenStdin: true,
-  HostConfig: {
-    PortBindings: config.PortBindings,
+/* ====================== FIXED createContainerOptions ======================
+   Root cause of "Failed to deploy instance" was here:
+   Docker throws: "conflicting options: port bindings and host network mode"
+   when NetworkMode = "host" (default on Linux) + PortBindings is present.
+   Fixed: PortBindings is now skipped on Linux (host mode).
+====================================================================== */
+const createContainerOptions = (config, volumePath) => {
+  const networkMode = process.platform === "win32" ? "bridge" : "host";
+
+  const hostConfig = {
     Binds: [`${volumePath}:/app/data`],
     Memory: config.Memory * 1024 * 1024,
     CpuCount: config.Cpu,
-    NetworkMode: process.platform === "win32" ? "bridge" : "host",
-  },
-  Env: config.Env,
-  ...(config.Cmd && { Cmd: config.Cmd }),
-});
+    NetworkMode: networkMode,
+  };
+
+  // Only add PortBindings when NOT using host network (Docker forbids it on Linux)
+  if (networkMode !== "host" && config.PortBindings) {
+    hostConfig.PortBindings = config.PortBindings;
+    log.info(`PortBindings enabled (bridge mode)`);
+  } else if (networkMode === "host") {
+    log.info(`Host network mode active → PortBindings skipped (Docker requirement)`);
+  }
+
+  return {
+    name: config.Id,
+    Image: config.Image,
+    ExposedPorts: config.Ports,
+    AttachStdout: true,
+    AttachStderr: true,
+    AttachStdin: true,
+    Tty: true,
+    OpenStdin: true,
+    HostConfig: hostConfig,
+    Env: config.Env,
+    ...(config.Cmd && { Cmd: config.Cmd }),
+  };
+};
 
 const createContainer = async (req, res) => {
   log.info("Deployment in progress...");
@@ -179,7 +198,7 @@ const createContainer = async (req, res) => {
         Image,
         Id,
         Cmd,
-        Ports: ExposedPorts || Ports,   // ← minimal fix for panel → wings compatibility
+        Ports: ExposedPorts || Ports,
         Memory,
         Cpu,
         PortBindings,
@@ -196,7 +215,7 @@ const createContainer = async (req, res) => {
       message: "Deployment started",
       Env: environmentVariables,
       volumeId: Id,
-      containerId: container.id,   // ← critical for panel
+      containerId: container.id,
     });
 
     if (Scripts && Scripts.Install && Array.isArray(Scripts.Install)) {
@@ -226,7 +245,7 @@ const createContainer = async (req, res) => {
   }
 };
 
-// === Other routes ===
+// === Other routes (unchanged) ===
 const deleteContainer = async (req, res) => {
   const containerId = req.params.id;
   const container = docker.getContainer(containerId);
