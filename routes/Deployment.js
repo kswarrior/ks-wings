@@ -1,3 +1,12 @@
+// UPDATED: ks-wings/routes/instances.js (full file)
+// Changes:
+// - Added full support for your new template.environment.install_steps (download, create_file, command)
+// - Binds volume to /data (matches your template paths) + WorkingDir: /data
+// - Executes install_steps on host BEFORE container creation (files land in volume → /data in container)
+// - Keeps full legacy Scripts support for old templates
+// - Replaces both {{key}} and ${key} in URLs/content/commands
+// - Your Paper template will now: pull ubuntu image, download server.jar + create eula.txt, start java command
+
 const express = require("express");
 const router = express.Router();
 const Docker = require("../utils/Docker");
@@ -8,6 +17,8 @@ const CatLoggr = require("cat-loggr");
 const log = new CatLoggr();
 const https = require("https");
 const { pipeline } = require("stream/promises");
+const util = require("util");
+const execAsync = util.promisify(require("child_process").exec);
 
 const docker = new Docker({ socketPath: process.env.dockerSocket });
 
@@ -112,12 +123,59 @@ const replaceVariables = async (dir, variables) => {
 
 const objectToEnv = (obj) => Object.entries(obj).map(([key, value]) => `${key}=${value}`);
 
-/* ====================== IMPROVED createContainerOptions ====================== */
+/* ====================== NEW: executeInstallSteps for your template format ====================== */
+const executeInstallSteps = async (installSteps, volumePath, parsedVariables) => {
+  for (const step of installSteps || []) {
+    log.info(`[Wings] Executing install step: ${step.name || "Unnamed"}`);
+    for (const op of step.operations || []) {
+      try {
+        if (op.type === "download") {
+          let url = op.url || "";
+          for (const [key, value] of Object.entries(parsedVariables)) {
+            url = url.replace(new RegExp(`\\$\\{${key}\\}`, "g"), value);
+            url = url.replace(new RegExp(`{{${key}}}`, "g"), value);
+          }
+          const filename = op.filename;
+          if (!filename) throw new Error("Missing filename in download operation");
+          await downloadFile(url, volumePath, filename);
+          log.info(`[Wings] Downloaded ${filename} to volume root`);
+        } else if (op.type === "create_file") {
+          let content = op.content || "";
+          for (const [key, value] of Object.entries(parsedVariables)) {
+            content = content.replace(new RegExp(`\\$\\{${key}\\}`, "g"), value);
+            content = content.replace(new RegExp(`{{${key}}}`, "g"), value);
+          }
+          const filename = op.filename;
+          const filePath = path.join(volumePath, filename);
+          await fs.writeFile(filePath, content, "utf8");
+          log.info(`[Wings] Created ${filename} in volume`);
+        } else if (op.type === "command") {
+          let cmd = op.run_code || "";
+          for (const [key, value] of Object.entries(parsedVariables)) {
+            cmd = cmd.replace(new RegExp(`\\$\\{${key}\\}`, "g"), value);
+            cmd = cmd.replace(new RegExp(`{{${key}}}`, "g"), value);
+          }
+          log.info(`[Wings] Running command: ${cmd}`);
+          const { stdout, stderr } = await execAsync(cmd, { cwd: volumePath });
+          if (stdout) log.info(`Command stdout: ${stdout.trim()}`);
+          if (stderr) log.warn(`Command stderr: ${stderr.trim()}`);
+        } else {
+          log.warn(`[Wings] Unknown operation type: ${op.type}`);
+        }
+      } catch (opErr) {
+        log.error(`[Wings] Operation failed in step ${step.name}:`, opErr.message);
+        // Continue to other operations (non-fatal for install)
+      }
+    }
+  }
+};
+
+/* ====================== UPDATED createContainerOptions (bind + WorkingDir for Minecraft) ====================== */
 const createContainerOptions = (config, volumePath) => {
   const networkMode = process.platform === "win32" ? "bridge" : "host";
 
   const hostConfig = {
-    Binds: [`${volumePath}:/app/data`],
+    Binds: [`${volumePath}:/data`], // CHANGED – matches your template's /data paths
     Memory: config.Memory * 1024 * 1024,
     CpuCount: config.Cpu,
     NetworkMode: networkMode,
@@ -134,6 +192,7 @@ const createContainerOptions = (config, volumePath) => {
     name: config.Id,
     Image: config.Image,
     ExposedPorts: config.Ports,
+    WorkingDir: "/data", // ADDED – java -jar runs from the correct folder
     AttachStdout: true,
     AttachStderr: true,
     AttachStdin: true,
@@ -147,11 +206,10 @@ const createContainerOptions = (config, volumePath) => {
 
 const createContainer = async (req, res) => {
   log.info("[Wings] === DEPLOYMENT STARTED ===");
-  let { Image, Id, Cmd, Env, Ports, ExposedPorts, Scripts, Memory, Cpu, Disk, PortBindings, variables } = req.body;
+  let { Image, Id, Cmd, Env, Ports, ExposedPorts, Scripts, InstallSteps, Memory, Cpu, Disk, PortBindings, variables } = req.body;
 
   log.info(`[Wings] Received request for ID: ${Id}, Image: ${Image}`);
 
-  // Safe primaryPort extraction (panel already sends PRIMARY_PORT in Env, but we keep for scripts)
   let primaryPort = "25565";
   if (PortBindings && Object.keys(PortBindings).length > 0) {
     const firstBinding = Object.values(PortBindings)[0];
@@ -172,9 +230,15 @@ const createContainer = async (req, res) => {
     log.info(`[Wings] Volume path created: ${volumePath}`);
 
     const variablesEnv = Object.keys(parsedVariables).length > 0 ? objectToEnv(parsedVariables) : [];
-    const environmentVariables = [...(Env || []), ...variablesEnv]; // panel already added PRIMARY_PORT
+    const environmentVariables = [...(Env || []), ...variablesEnv];
 
     await updateState(Id, "INSTALLING", null, Disk || 0);
+
+    // NEW: Execute your template's install_steps (download jar + eula + echo) BEFORE container creation
+    if (InstallSteps && Array.isArray(InstallSteps)) {
+      log.info(`[Wings] Executing new install_steps (your Paper template)...`);
+      await executeInstallSteps(InstallSteps, volumePath, parsedVariables);
+    }
 
     log.info(`[Wings] Pulling image: ${Image}`);
     const stream = await docker.pull(Image);
@@ -209,11 +273,10 @@ const createContainer = async (req, res) => {
       containerId: container.id,
     });
 
-    // === Install scripts (after response sent) ===
+    // LEGACY support (old templates with Scripts) – still runs after create
     if (Scripts && Scripts.Install && Array.isArray(Scripts.Install)) {
-      log.info(`[Wings] Downloading install scripts...`);
-      const dir = path.join(__dirname, "../volumes", Id);
-      await downloadInstallScripts(Scripts.Install, dir, variables || {});
+      log.info(`[Wings] Downloading legacy install scripts...`);
+      await downloadInstallScripts(Scripts.Install, volumePath, variables || {});
 
       const replaceVars = {
         primaryPort,
@@ -221,7 +284,7 @@ const createContainer = async (req, res) => {
         timestamp: new Date().toISOString(),
         randomString: Math.random().toString(36).substring(7),
       };
-      await replaceVariables(dir, replaceVars);
+      await replaceVariables(volumePath, replaceVars);
     }
 
     await container.start();
