@@ -8,6 +8,9 @@ const path = require("path");
 const util = require("util");
 const execAsync = util.promisify(require("child_process").exec);
 
+const CatLoggr = require("cat-loggr");
+const log = new CatLoggr();
+
 const statesFilePath = path.join(__dirname, "../storage/states.json");
 
 const readStates = async () => {
@@ -41,16 +44,13 @@ const calculateDirectorySize = async (dirPath) => {
   }
 };
 
-// === YOUR EXISTING ROUTES (unchanged except now they work) ===
-router.post("/instances/:id/runcode", async (req, res) => { ... }); // keep exactly as you have
-
 router.post("/instances/:id/:power", async (req, res) => {
   const { power } = req.params;
   const containerId = req.params.id;
   const container = docker.getContainer(containerId);
 
   try {
-    // Disk limit check (now works)
+    // Disk limit check (start/restart only)
     if (power === "start" || power === "restart") {
       const state = await getStateForContainer(containerId);
       if (state && state.diskLimit && state.diskLimit > 0) {
