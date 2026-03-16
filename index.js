@@ -1,17 +1,3 @@
-// ================================================
-// ks-wings/index.js - FULLY FIXED & IMPROVED (v2)
-// ================================================
-// What was fixed this time (your "node not online" issue is solved):
-// • Restored the full disk limit check (you lost it in previous version)
-// • Made /stats 100% safe + consistent with startLoggingStats (no more crash risk)
-// • activeLogStreams prevents duplicate streams (main reason console was silent)
-// • Docker 8-byte header stripped → real logs appear
-// • Re-attach logs automatically after start/restart
-// • Proper cleanup on stop/close (no memory leaks)
-// • Removed broken containerLogs cache entirely (Docker tail:0 already gives history)
-// • No syntax/runtime errors on startup — tested logic, now prints "fully online"
-// • All other improvements kept (cleaner, safer, faster)
-
 process.env.dockerSocket =
   process.platform === "win32"
     ? "//./pipe/docker_engine"
@@ -39,9 +25,7 @@ const docker = new Docker({ socketPath: process.env.dockerSocket });
 const app = express();
 const server = http.createServer(app);
 const log = new CatLoggr();
-
-// NEW: Track active log streams to prevent duplicates & leaks
-const activeLogStreams = {};
+const containerLogs = {}; // Global store for logs
 
 console.log(chalk.gray(ascii) + chalk.white(`version v${config.version}\n`));
 
@@ -93,44 +77,70 @@ async function startLoggingStats() {
 
 startLoggingStats();
 
-// FIXED & BULLETPROOF /stats (matches startLoggingStats + safe fallback)
+// Enhanced /stats with bulletproof error handling and logging
 app.get("/stats", async (req, res) => {
-  log.debug('Stats endpoint called');
+  log.debug('Stats endpoint called - starting processing');
 
-  let totalStats = { cpu: 0, ram: { total: 0, used: 0 }, disk: { total: 0, used: 0 } };
+  let totalStats = { cpu: 0, ram: { total: 0, used: 0 }, disk: { total: 0, used: 0 } }; // Fallback
   let onlineContainersCount = 0;
   let uptime = "0m";
 
   try {
+    // Handle statsLogger safely
     log.debug('Fetching system stats...');
-    totalStats = await statsLogger.getSystemStats();
-    log.debug('System stats fetched successfully');
-  } catch (statsErr) {
-    log.error("Error in statsLogger.getSystemStats:", statsErr);
-  }
+    try {
+      const statsObj = statsLogger.getSystemStats;
+      if (typeof statsObj.total === 'function') {
+        totalStats = statsObj.total();
+        log.debug('System stats fetched successfully');
+      } else {
+        log.warn('total() not a function on getSystemStats - using fallback');
+      }
+    } catch (statsErr) {
+      log.error("Error in statsLogger:", statsErr);
+    }
 
-  try {
+    // Handle Docker containers safely
     log.debug('Fetching Docker containers...');
-    const containers = await docker.listContainers({ all: true });
-    onlineContainersCount = containers.filter(c => c.State === "running").length;
-  } catch (dockerErr) {
-    log.error("Error listing containers:", dockerErr);
+    try {
+      const containers = await docker.listContainers({ all: true });
+      onlineContainersCount = containers.filter(
+        (container) => container.State === "running"
+      ).length;
+      log.debug(`Found ${containers.length} containers, ${onlineContainersCount} online`);
+    } catch (dockerErr) {
+      log.error("Error listing containers:", dockerErr);
+    }
+
+    // Uptime calculation (always safe)
+    const uptimeInSeconds = process.uptime();
+    const formatUptime = (uptime) => {
+      const minutes = Math.floor((uptime / 60) % 60);
+      const hours = Math.floor((uptime / 3600) % 24);
+      const days = Math.floor(uptime / 86400);
+      const parts = [];
+
+      if (days > 0) parts.push(`${days}d`);
+      if (hours > 0) parts.push(`${hours}h`);
+      if (minutes > 0) parts.push(`${minutes}m`);
+      if (parts.length === 0) return "0m";
+
+      return parts.join(" ");
+    };
+    uptime = formatUptime(uptimeInSeconds);
+
+    const responseStats = {
+      totalStats,
+      onlineContainersCount,
+      uptime,
+    };
+
+    log.debug('Stats response prepared - sending OK');
+    res.json(responseStats);
+  } catch (error) {
+    log.error("Critical error in /stats endpoint:", error);
+    res.status(500).json({ error: "Failed to fetch stats", uptime: "0m" }); // Ensure uptime is set for panel check
   }
-
-  const uptimeInSeconds = process.uptime();
-  const formatUptime = (u) => {
-    const m = Math.floor((u / 60) % 60);
-    const h = Math.floor((u / 3600) % 24);
-    const d = Math.floor(u / 86400);
-    const p = [];
-    if (d > 0) p.push(`${d}d`);
-    if (h > 0) p.push(`${h}h`);
-    if (m > 0) p.push(`${m}m`);
-    return p.length ? p.join(" ") : "0m";
-  };
-  uptime = formatUptime(uptimeInSeconds);
-
-  res.json({ totalStats, onlineContainersCount, uptime });
 });
 
 // FTP
@@ -140,45 +150,58 @@ function loadRouters() {
   const routesDir = path.join(__dirname, "routes");
   try {
     if (!fs.existsSync(routesDir)) {
-      log.warn("Routes directory not found");
+      log.warn("Routes directory not found - no additional routes loaded.");
       return;
     }
-    fs.readdirSync(routesDir).forEach(file => {
+    const files = fs.readdirSync(routesDir);
+    
+    files.forEach((file) => {
       if (file.endsWith(".js")) {
         try {
-          const router = require(path.join(routesDir, file));
+          const routerPath = path.join(routesDir, file);
+          const router = require(routerPath);
           if (typeof router === "function" && router.name === "router") {
+            const routeName = path.parse(file).name;
             app.use('/', router);
-            log.info(`Loaded router: ${path.parse(file).name}`);
+            log.info(`Loaded router: ${routeName}`);
+          } else {
+            log.warn(`File ${file} isn't a router. Not loading it`);
           }
-        } catch (e) {
-          log.error(`Error loading ${file}: ${e.message}`);
+        } catch (error) {
+          log.error(`Error loading router from ${file}: ${error.message}`);
         }
       }
     });
     log.info("All routers loaded successfully.");
   } catch (err) {
-    log.error(`Error reading routes: ${err.message}`);
+    log.error(`Error reading routes directory: ${err.message}`);
   }
 }
 
-// Utility
-function formatLogMessage(content) {
+// Utility functions (global)
+function initializeContainerLogs(containerId) {
+  if (!containerLogs[containerId]) {
+    containerLogs[containerId] = [];
+  }
+}
+
+function formatLogMessage(logMessage) {
+  const { content } = logMessage;
   return content
     .split('\n')
-    .filter(l => l.length > 0)
-    .map(l => `\r\n\u001b[34m[docker] \x1b[0m${l}\r\n`)
+    .filter(line => line.length > 0)
+    .map(line => `\r\n\u001b[34m[docker] \x1b[0m${line}\r\n`)
     .join('');
 }
 
-// FIXED: Docker log streaming with header strip + active stream tracking
 async function streamDockerLogs(ws, container) {
   const containerId = container.id;
+  initializeContainerLogs(containerId);
 
-  // Destroy old stream if exists (prevents duplicates)
-  if (activeLogStreams[containerId]) {
-    try { activeLogStreams[containerId].destroy(); } catch (_) {}
-    delete activeLogStreams[containerId];
+  if (containerLogs[containerId].length > 0) {
+    containerLogs[containerId].forEach((logMessage) => {
+      ws.send(formatLogMessage(logMessage));
+    });
   }
 
   try {
@@ -189,30 +212,40 @@ async function streamDockerLogs(ws, container) {
       tail: 0,
     });
 
-    activeLogStreams[containerId] = logStream;
+    if (!logStream) {
+      throw new Error("Log stream is undefined");
+    }
 
     logStream.on("data", (chunk) => {
-      // === CRITICAL FIX: Strip Docker 8-byte binary header ===
-      const content = chunk.length > 8 
-        ? chunk.slice(8).toString('utf8') 
-        : chunk.toString('utf8');
-
-      const formatted = formatLogMessage(content);
+      const logMessage = {
+        timestamp: new Date().toISOString(),
+        content: chunk.toString(),
+      };
+      containerLogs[containerId].push(logMessage);
+      const formattedMessage = formatLogMessage(logMessage);
       if (ws.readyState === ws.OPEN && ws.bufferedAmount === 0) {
-        ws.send(formatted);
+        ws.send(formattedMessage);
       }
     });
 
     logStream.on("error", (err) => {
-      log.error(`Log stream error: ${err.message}`);
-      if (ws.readyState === ws.OPEN) ws.send(`\r\n\u001b[31m[kswings] \x1b[0mLog stream error: ${err.message}\r\n`);
+      log.error(`Docker log stream error: ${err.message}`);
+      if (ws.readyState === ws.OPEN) {
+        ws.send(`\r\n\u001b[31m[kswings] \x1b[0mLog stream error: ${err.message}\r\n`);
+      }
     });
 
-    logStream.on("end", () => delete activeLogStreams[containerId]);
-
+    ws.on('close', () => {
+      try {
+        logStream.destroy();
+      } catch (_) {}
+      log.info("WebSocket client disconnected");
+    });
   } catch (err) {
-    log.error(`Failed to attach logs: ${err.message}`);
-    if (ws.readyState === ws.OPEN) ws.send(`\r\n\u001b[31m[kswings] \x1b[0mFailed to attach logs: ${err.message}\r\n`);
+    log.error(`Failed to attach Docker logs: ${err.message}`);
+    if (ws.readyState === ws.OPEN) {
+      ws.send(`\r\n\u001b[31m[kswings] \x1b[0mFailed to attach logs: ${err.message}\r\n`);
+    }
   }
 }
 
@@ -223,28 +256,48 @@ async function getVolumeSize(volumeId) {
     const totalSize = await calculateDirectorySizeAsync(volumePath);
     return (totalSize / (1024 * 1024)).toFixed(2);
   } catch (err) {
-    log.warn(`Volume size failed ${volumeId}: ${err.message}`);
+    log.warn(`Failed to calculate volume size for ${volumeId}: ${err.message}`);
     return "0";
   }
 }
 
-async function calculateDirectorySizeAsync(dirPath, depth = 0) {
-  if (depth >= 500) return 0;
+async function calculateDirectorySizeAsync(dirPath, currentDepth = 0) {
+  if (currentDepth >= 500) {
+    log.warn(`Maximum depth reached at ${dirPath}`);
+    return 0;
+  }
+
   return new Promise((resolve, reject) => {
     fs.readdir(dirPath, { withFileTypes: true }, (err, files) => {
-      if (err) return reject(err);
-      let size = 0, done = 0;
-      if (!files.length) return resolve(0);
-      files.forEach(f => {
-        const p = path.join(dirPath, f.name);
-        fs.stat(p, (e, s) => {
-          if (e) { done++; if (done === files.length) resolve(size); return; }
-          if (s.isDirectory()) {
-            calculateDirectorySizeAsync(p, depth + 1).then(sz => { size += sz; done++; if (done === files.length) resolve(size); }).catch(reject);
+      if (err) {
+        reject(err);
+        return;
+      }
+      let totalSize = 0;
+      let processed = 0;
+      const totalFiles = files.length;
+      if (totalFiles === 0) {
+        resolve(0);
+        return;
+      }
+      files.forEach((file) => {
+        const filePath = path.join(dirPath, file.name);
+        fs.stat(filePath, (statErr, stats) => {
+          if (statErr) {
+            processed++;
+            if (processed === totalFiles) resolve(totalSize);
+            return;
+          }
+          if (stats.isDirectory()) {
+            calculateDirectorySizeAsync(filePath, currentDepth + 1).then((size) => {
+              totalSize += size;
+              processed++;
+              if (processed === totalFiles) resolve(totalSize);
+            }).catch(reject);
           } else {
-            size += s.size;
-            done++;
-            if (done === files.length) resolve(size);
+            totalSize += stats.size;
+            processed++;
+            if (processed === totalFiles) resolve(totalSize);
           }
         });
       });
@@ -252,19 +305,48 @@ async function calculateDirectorySizeAsync(dirPath, depth = 0) {
   });
 }
 
+function formatBytes(bytes) {
+  if (bytes === 0) return "0 Bytes";
+  const k = 1024;
+  const sizes = ["Bytes", "KB", "MB", "GB", "TB"];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
+}
+
 async function executeCommand(ws, container, command) {
   try {
-    const exec = await container.exec({ Cmd: ['sh', '-c', command], AttachStdin: true, AttachStdout: true, AttachStderr: true, Tty: true });
+    const exec = await container.exec({
+      Cmd: ['sh', '-c', command],
+      AttachStdin: true,
+      AttachStdout: true,
+      AttachStderr: true,
+      Tty: true
+    });
     const stream = await exec.start();
-    stream.on("data", c => ws.readyState === ws.OPEN && ws.send(c.toString('utf8')));
-    stream.on("end", () => ws.readyState === ws.OPEN && ws.send('\nCommand execution completed'));
+    stream.on("data", (chunk) => {
+      if (ws.readyState === ws.OPEN) {
+        ws.send(chunk.toString('utf8'));
+      }
+    });
+    stream.on("end", () => {
+      if (ws.readyState === ws.OPEN) {
+        ws.send('\nCommand execution completed');
+      }
+    });
+    stream.on("error", (err) => {
+      log.error("Exec stream error:", err);
+      if (ws.readyState === ws.OPEN) {
+        ws.send(`Error in exec stream: ${err.message}`);
+      }
+    });
   } catch (err) {
-    log.error("Exec error:", err);
-    if (ws.readyState === ws.OPEN) ws.send(`Failed to execute command: ${err.message}`);
+    log.error("Failed to execute command:", err);
+    if (ws.readyState === ws.OPEN) {
+      ws.send(`Failed to execute command: ${err.message}`);
+    }
   }
 }
 
-// IMPROVED performPowerAction - full disk check restored + proper stream handling
 async function performPowerAction(ws, container, action) {
   const actionMap = {
     start: container.start.bind(container),
@@ -273,58 +355,65 @@ async function performPowerAction(ws, container, action) {
   };
 
   if (!actionMap[action]) {
-    ws.readyState === ws.OPEN && ws.send(`\r\n\u001b[33m[kswings] \x1b[0mInvalid action: ${action}\r\n`);
+    if (ws.readyState === ws.OPEN) {
+      ws.send(`\r\n\u001b[33m[kswings] \x1b[0mInvalid action: ${action}\r\n`);
+    }
     return;
   }
 
   const containerId = container.id;
 
-  // === RESTORED: Full disk limit check (was accidentally removed before) ===
   if (action === "start" || action === "restart") {
     try {
-      const info = await container.inspect();
-      const dataMount = info.Mounts.find(m => m.Type === "bind" && m.Destination === "/app/data");
+      const containerInfo = await container.inspect();
+      const dataMount = containerInfo.Mounts.find(
+        (m) => m.Type === "bind" && m.Destination === "/app/data"
+      );
+
       if (dataMount) {
-        const volId = path.basename(dataMount.Source);
-        const statesPath = path.join(__dirname, "storage/states.json");
-        if (fs.existsSync(statesPath)) {
-          const states = JSON.parse(fs.readFileSync(statesPath, "utf8"));
-          if (states[volId] && states[volId].diskLimit > 0) {
-            const sizeMiB = parseFloat(await getVolumeSize(volId)) || 0;
-            if (sizeMiB >= states[volId].diskLimit) {
-              ws.readyState === ws.OPEN && ws.send(
-                `\r\n\u001b[31m[kswings] \x1b[0mCannot ${action}: storage limit exceeded (${sizeMiB.toFixed(2)} MiB / ${states[volId].diskLimit} MiB)\r\n`
-              );
+        const volumePath = dataMount.Source;
+        const volumeId = path.basename(volumePath);
+        const statesFilePath = path.join(__dirname, "storage/states.json");
+
+        if (fs.existsSync(statesFilePath)) {
+          const statesData = JSON.parse(fs.readFileSync(statesFilePath, "utf8"));
+          if (statesData[volumeId] && statesData[volumeId].diskLimit > 0) {
+            const volumeSize = await getVolumeSize(volumeId);
+            const volumeSizeMiB = parseFloat(volumeSize) || 0;
+            if (volumeSizeMiB >= statesData[volumeId].diskLimit) {
+              if (ws.readyState === ws.OPEN) {
+                ws.send(
+                  `\r\n\u001b[31m[kswings] \x1b[0mCannot ${action}: storage limit exceeded (${volumeSizeMiB.toFixed(2)} MiB / ${statesData[volumeId].diskLimit} MiB). Delete files or increase limit.\r\n`
+                );
+              }
               return;
             }
           }
         }
       }
-    } catch (e) {
-      log.warn("Disk check failed:", e.message);
+    } catch (checkErr) {
+      log.warn("Failed to check storage limit for power action:", checkErr.message);
     }
   }
 
-  ws.readyState === ws.OPEN && ws.send(`\r\n\u001b[33m[kswings] \x1b[0mWorking on ${action}...\r\n`);
-
-  // Destroy current stream before stop/restart
-  if (activeLogStreams[containerId]) {
-    try { activeLogStreams[containerId].destroy(); } catch (_) {}
-    delete activeLogStreams[containerId];
-  }
+  const message = `\r\n\u001b[33m[kswings] \x1b[0mWorking on ${action}...\r\n`;
+  if (ws.readyState === ws.OPEN) ws.send(message);
 
   try {
+    if (action === "restart" || action === "stop") {
+      containerLogs[containerId] = [];
+    }
+
+    streamDockerLogs(ws, container);
+
     await actionMap[action]();
 
-    ws.readyState === ws.OPEN && ws.send(`\r\n\u001b[32m[kswings] \x1b[0m${action.charAt(0).toUpperCase() + action.slice(1)} completed.\r\n`);
-
-    // Re-attach logs after start or restart
-    if (action === "start" || action === "restart") {
-      streamDockerLogs(ws, container);
-    }
+    const successMessage = `\r\n\u001b[32m[kswings] \x1b[0m${action.charAt(0).toUpperCase() + action.slice(1)} action completed.\r\n`;
+    if (ws.readyState === ws.OPEN) ws.send(successMessage);
   } catch (err) {
-    log.error(`Power action failed:`, err);
-    ws.readyState === ws.OPEN && ws.send(`\r\n\u001b[31m[kswings] \x1b[0mAction failed: ${err.message}\r\n`);
+    log.error(`Error performing ${action} action:`, err.message);
+    const errorMessage = `\r\n\u001b[31m[kswings] \x1b[0mAction failed: ${err.message}\r\n`;
+    if (ws.readyState === ws.OPEN) ws.send(errorMessage);
   }
 }
 
@@ -335,108 +424,169 @@ function initializeWebSocketServer(server) {
     let isAuthenticated = false;
 
     ws.on("message", async (message) => {
-      let msg;
-      try { msg = JSON.parse(message.toString()); } catch {
-        ws.readyState === ws.OPEN && ws.send("Invalid JSON");
+      log.debug("got " + message);
+      let msg = {};
+      try {
+        msg = JSON.parse(message.toString());
+      } catch (error) {
+        if (ws.readyState === ws.OPEN) ws.send("Invalid JSON");
         return;
       }
 
       if (msg.event === "auth" && msg.args) {
-        authenticateWebSocket(ws, req, msg.args[0], (ok, cid, vid) => {
-          if (ok) {
-            isAuthenticated = true;
-            handleWebSocketConnection(ws, req, cid, vid);
-          } else {
-            ws.close(1008, "Authentication failed");
+        authenticateWebSocket(
+          ws,
+          req,
+          msg.args[0],
+          (authenticated, containerId, volumeId) => {
+            if (authenticated) {
+              isAuthenticated = true;
+              handleWebSocketConnection(ws, req, containerId, volumeId);
+            } else {
+              if (ws.readyState === ws.OPEN) ws.send("Authentication failed");
+              ws.close(1008, "Authentication failed");
+            }
           }
-        });
+        );
       } else if (isAuthenticated) {
-        const containerId = req.url.split("/")[2];
+        const urlParts = req.url.split("/");
+        const containerId = urlParts[2];
+
+        if (!containerId) {
+          ws.close(1008, "Container ID not specified");
+          return;
+        }
+
         const container = docker.getContainer(containerId);
 
         switch (msg.event) {
-          case "cmd": executeCommand(ws, container, msg.args?.[0] || msg.command); break;
-          case "power:start": performPowerAction(ws, container, "start"); break;
-          case "power:stop": performPowerAction(ws, container, "stop"); break;
-          case "power:restart": performPowerAction(ws, container, "restart"); break;
+          case "cmd":
+            if (msg.args && msg.args[0]) executeCommand(ws, container, msg.args[0]);
+            else if (msg.command) executeCommand(ws, container, msg.command); // Fallback for old format
+            break;
+          case "power:start":
+            performPowerAction(ws, container, "start");
+            break;
+          case "power:stop":
+            performPowerAction(ws, container, "stop");
+            break;
+          case "power:restart":
+            performPowerAction(ws, container, "restart");
+            break;
+          default:
+            if (ws.readyState === ws.OPEN) ws.send("Unsupported event");
+            break;
         }
+      } else {
+        if (ws.readyState === ws.OPEN) ws.send("Unauthorized access");
+        ws.close(1008, "Unauthorized access");
       }
     });
 
-    function authenticateWebSocket(ws, req, pass, cb) {
-      if (pass === config.key) {
-        ws.send(`\r\n\u001b[33m[kswings] \x1b[0mconnected!\r\n`);
-        const parts = req.url.split("/");
-        cb(true, parts[2], parseInt(parts[3] || 0));
+    function authenticateWebSocket(ws, req, password, callback) {
+      if (password === config.key) {
+        log.info("successful authentication on ws");
+        if (ws.readyState === ws.OPEN) ws.send(`\r\n\u001b[33m[kswings] \x1b[0mconnected!\r\n`);
+        const urlParts = req.url.split("/");
+        const containerId = urlParts[2];
+        const volumeId = urlParts[3] || 0;
+
+        if (!containerId) {
+          ws.close(1008, "Container ID not specified");
+          callback(false, null, null);
+          return;
+        }
+
+        callback(true, containerId, parseInt(volumeId));
       } else {
-        cb(false);
+        log.warn("authentication failure on websocket!");
+        callback(false, null, null);
       }
     }
 
     function handleWebSocketConnection(ws, req, containerId, volumeId) {
       const container = docker.getContainer(containerId);
-      container.inspect((err) => {
-        if (err) return ws.send("Container not found");
+
+      container.inspect(async (err, data) => {
+        if (err) {
+          if (ws.readyState === ws.OPEN) ws.send("Container not found");
+          return;
+        }
 
         if (req.url.startsWith("/exec/")) {
           setupExecSession(ws, container);
         } else if (req.url.startsWith("/stats/")) {
           setupStatsStreaming(ws, container, volumeId);
         } else {
-          ws.close(1002, "Invalid URL");
+          ws.close(1002, "URL must start with /exec/ or /stats/");
         }
       });
     }
 
     async function setupExecSession(ws, container) {
       streamDockerLogs(ws, container);
-
-      ws.once('close', () => {
-        const cid = container.id;
-        if (activeLogStreams[cid]) {
-          try { activeLogStreams[cid].destroy(); } catch (_) {}
-          delete activeLogStreams[cid];
-        }
-        log.info("WebSocket client disconnected");
-      });
     }
 
     async function setupStatsStreaming(ws, container, volumeId) {
+      const statesFilePath = path.join(__dirname, "storage/states.json");
       let diskLimit = 0;
       try {
-        const statesPath = path.join(__dirname, "storage/states.json");
-        if (fs.existsSync(statesPath)) {
-          const data = JSON.parse(fs.readFileSync(statesPath, "utf8"));
-          diskLimit = data[volumeId]?.diskLimit || 0;
+        if (fs.existsSync(statesFilePath)) {
+          const statesData = JSON.parse(fs.readFileSync(statesFilePath, "utf8"));
+          if (statesData[volumeId] && statesData[volumeId].diskLimit) {
+            diskLimit = statesData[volumeId].diskLimit;
+          }
         }
-      } catch {}
+      } catch (err) {
+        log.warn("Failed to read disk limit from states:", err.message);
+      }
 
       let hasAutoStopped = false;
-      const interval = setInterval(async () => {
-        try {
-          const stats = await new Promise((res, rej) => container.stats({ stream: false }, (e, d) => e ? rej(e) : res(d)));
-          const volSize = await getVolumeSize(volumeId.toString());
-          const sizeMiB = parseFloat(volSize) || 0;
-          const exceeded = diskLimit > 0 && sizeMiB >= diskLimit;
-          stats.volumeSize = volSize;
-          stats.diskLimit = diskLimit;
-          stats.storageExceeded = exceeded;
 
-          if (exceeded && !hasAutoStopped) {
-            const info = await container.inspect();
-            if (info.State.Running) {
+      const fetchStats = async () => {
+        try {
+          const stats = await new Promise((resolve, reject) => {
+            container.stats({ stream: false }, (err, data) => {
+              if (err) reject(err);
+              else resolve(data);
+            });
+          });
+
+          const volumeSize = await getVolumeSize(volumeId.toString());
+          stats.volumeSize = volumeSize;
+          stats.diskLimit = diskLimit;
+          const volumeSizeMiB = parseFloat(volumeSize) || 0;
+          const storageExceeded = diskLimit > 0 && volumeSizeMiB >= diskLimit;
+          stats.storageExceeded = storageExceeded;
+
+          if (storageExceeded && !hasAutoStopped) {
+            const containerInfo = await container.inspect();
+            if (containerInfo.State.Running) {
+              log.warn(`Storage exceeded for container ${container.id} - auto-stopping`);
               await container.stop();
               hasAutoStopped = true;
             }
           }
 
-          ws.readyState === ws.OPEN && ws.send(JSON.stringify({ event: 'stats', args: [stats] }));
-        } catch (e) {
-          ws.readyState === ws.OPEN && ws.send(JSON.stringify({ error: 'Failed to fetch stats' }));
+          if (ws.readyState === ws.OPEN) {
+            ws.send(JSON.stringify({
+              event: 'stats',
+              args: [stats]
+            }));
+          }
+        } catch (err) {
+          log.error(`Failed to fetch stats for container ${container.id}:`, err.message);
+          if (ws.readyState === ws.OPEN) {
+            ws.send(JSON.stringify({ error: 'Failed to fetch stats' }));
+          }
         }
-      }, 1000);
+      };
 
-      ws.on('close', () => clearInterval(interval));
+      const statsInterval = setInterval(fetchStats, 1000);
+
+      ws.on('close', () => {
+        clearInterval(statsInterval);
+      });
     }
   });
 
@@ -444,26 +594,44 @@ function initializeWebSocketServer(server) {
 }
 
 app.get("/", async (req, res) => {
+  log.debug('Root endpoint called - health check');
   try {
-    const [dockerInfo, ping] = await Promise.all([docker.info(), docker.ping()]);
-    res.json({
+    const dockerInfo = await docker.info();
+    const isDockerRunning = await docker.ping();
+
+    const response = {
       versionFamily: 1,
       versionRelease: "kswings " + config.version,
       online: true,
       remote: config.remote,
-      mysql: config.mysql,
-      docker: { status: ping ? "running" : "not running", systemInfo: dockerInfo }
+      mysql: {
+        host: config.mysql.host,
+        user: config.mysql.user,
+        password: config.mysql.password,
+      },
+      docker: {
+        status: isDockerRunning ? "running" : "not running",
+        systemInfo: dockerInfo,
+      },
+    };
+
+    log.debug('Root response sent OK');
+    res.json(response);
+  } catch (error) {
+    log.error("Error in root endpoint:", error);
+    res.status(500).json({
+      error: "Daemon error",
+      online: false,
     });
-  } catch (e) {
-    res.status(500).json({ error: "Daemon error", online: false });
   }
 });
 
-app.use((err, req, res) => {
+app.use((err, req, res, next) => {
   log.error(err.stack);
   res.status(500).send("Something has... gone wrong!");
 });
 
+// Listen immediately with explicit online log
 const port = config.port || 8080;
 server.listen(port, () => {
   log.info(`kswings is listening on port ${port}`);
@@ -471,5 +639,13 @@ server.listen(port, () => {
   log.info("ks-wings is fully online and ready for panel connections.");
 });
 
-process.on('SIGTERM', () => { log.info('SIGTERM'); server.close(() => process.exit(0)); });
-process.on('SIGINT', () => { log.info('SIGINT'); server.close(() => process.exit(0)); });
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  log.info('SIGTERM received, shutting down gracefully');
+  server.close(() => process.exit(0));
+});
+
+process.on('SIGINT', () => {
+  log.info('SIGINT received, shutting down gracefully');
+  server.close(() => process.exit(0));
+});
