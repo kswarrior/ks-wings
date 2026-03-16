@@ -38,8 +38,65 @@ function getStateForContainer(containerId) {
 }
 
 /**
+ * POST /instances/:id/runcode
+ * Sends a command to the container's stdin (used by panel for "stop")
+ * MUST be defined BEFORE the :power route
+ */
+router.post("/instances/:id/runcode", async (req, res) => {
+  const { id } = req.params;
+  const { command } = req.body;
+
+  if (!command || typeof command !== "string" || command.trim() === "") {
+    return res.status(400).json({ error: "Valid 'command' string is required" });
+  }
+
+  const container = docker.getContainer(id);
+
+  try {
+    // Check if container is running
+    const inspect = await container.inspect();
+    if (!inspect.State.Running) {
+      return res.status(409).json({ error: "Container is not running" });
+    }
+
+    // Send command to PID 1 stdin via /proc/1/fd/0
+    const exec = await container.exec({
+      Cmd: ["sh", "-c", `echo "${command.replace(/"/g, '\\"')}" > /proc/1/fd/0`],
+      AttachStdin: false,
+      AttachStdout: false,
+      AttachStderr: false,
+      Tty: false,
+    });
+
+    await exec.start();
+    log.info(`[Wings] Console command sent to ${id}: ${command}`);
+
+    res.status(200).json({
+      message: `Command "${command}" sent to container console`,
+      command: command
+    });
+  } catch (err) {
+    log.error(`[Wings] Failed to send command "${command}" to ${id}:`, err.message);
+
+    // Fallback: force stop after timeout
+    try {
+      await container.stop({ t: 10 });
+      res.status(200).json({
+        message: `Command send failed → forced container stop after 10s grace`,
+        fallback: "stop"
+      });
+    } catch (stopErr) {
+      res.status(500).json({
+        error: "Failed to send command and fallback stop also failed",
+        details: stopErr.message
+      });
+    }
+  }
+});
+
+/**
  * POST /instances/:id/:power
- * Standard Docker power actions with disk limit check for start/restart
+ * Standard Docker power actions with disk limit check
  */
 router.post("/instances/:id/:power", async (req, res) => {
   const { power } = req.params;
@@ -65,7 +122,6 @@ router.post("/instances/:id/:power", async (req, res) => {
           }
         } catch (sizeErr) {
           console.warn("Could not calculate volume size:", sizeErr.message);
-          // Continue anyway (fail-open)
         }
       }
     }
@@ -89,70 +145,12 @@ router.post("/instances/:id/:power", async (req, res) => {
     }
   } catch (err) {
     if (err.statusCode === 304) {
-      // Already in desired state (e.g. already running when start called)
       res.status(304).json({ message: err.message || "Container already in desired state" });
     } else {
       log.error(`Power action failed (${power} on ${containerId}):`, err.message);
       res.status(500).json({ 
         message: "Failed to perform power action",
         error: err.message 
-      });
-    }
-  }
-});
-
-/**
- * POST /instances/:id/runcode
- * Sends a command to the container's stdin (useful for graceful shutdown like "stop" in Minecraft)
- * Used by panel for template-defined stop commands
- */
-router.post("/instances/:id/runcode", async (req, res) => {
-  const { id } = req.params;
-  const { command } = req.body;
-
-  if (!command || typeof command !== "string" || command.trim() === "") {
-    return res.status(400).json({ error: "Valid 'command' string is required" });
-  }
-
-  const container = docker.getContainer(id);
-
-  try {
-    // Check if container is running
-    const inspect = await container.inspect();
-    if (!inspect.State.Running) {
-      return res.status(409).json({ error: "Container is not running" });
-    }
-
-    // Send command to PID 1 stdin via /proc/1/fd/0 (works in most Minecraft images)
-    const exec = await container.exec({
-      Cmd: ["sh", "-c", `echo "${command.replace(/"/g, '\\"')}" > /proc/1/fd/0`],
-      AttachStdin: false,
-      AttachStdout: false,
-      AttachStderr: false,
-      Tty: false,
-    });
-
-    await exec.start();
-    log.info(`[Wings] Console command sent to ${id}: ${command}`);
-
-    res.status(200).json({
-      message: `Command "${command}" sent to container console`,
-      command: command
-    });
-  } catch (err) {
-    log.error(`[Wings] Failed to send command "${command}" to ${id}:`, err.message);
-
-    // Fallback: force stop after timeout if command send fails
-    try {
-      await container.stop({ t: 10 }); // 10 seconds grace period
-      res.status(200).json({
-        message: `Command send failed → forced container stop after 10s grace`,
-        fallback: "stop"
-      });
-    } catch (stopErr) {
-      res.status(500).json({
-        error: "Failed to send command and fallback stop also failed",
-        details: stopErr.message
       });
     }
   }
