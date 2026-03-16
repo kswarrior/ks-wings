@@ -1,11 +1,15 @@
 // UPDATED: ks-wings/routes/instances.js (full file)
 // Changes:
-// - Added full support for your new template.environment.install_steps (download, create_file, command)
-// - Binds volume to /data (matches your template paths) + WorkingDir: /data
-// - Executes install_steps on host BEFORE container creation (files land in volume → /data in container)
-// - Keeps full legacy Scripts support for old templates
-// - Replaces both {{key}} and ${key} in URLs/content/commands
-// - Your Paper template will now: pull ubuntu image, download server.jar + create eula.txt, start java command
+// - Full support for new template.environment.install_steps (download, create_file, command)
+// - Volume bind to /data + WorkingDir: /data (perfect for your Paper template)
+// - Executes install_steps on host BEFORE container creation
+// - Keeps full legacy Scripts support
+// - Replaces both {{key}} and ${key}
+// - CRITICAL FIX FOR YOUR PROBLEM:
+//     • Container is now STARTED (idle) after creation
+//     • State set to "STOPPED" (exactly what you asked: image + install, but NO auto-start)
+//     • Start / Restart / Stop buttons + custom actions (run_code) now work perfectly
+// - Your Paper template will: pull image, download jar + create eula.txt, create container, start it idle, show as STOPPED
 
 const express = require("express");
 const router = express.Router();
@@ -164,18 +168,17 @@ const executeInstallSteps = async (installSteps, volumePath, parsedVariables) =>
         }
       } catch (opErr) {
         log.error(`[Wings] Operation failed in step ${step.name}:`, opErr.message);
-        // Continue to other operations (non-fatal for install)
       }
     }
   }
 };
 
-/* ====================== UPDATED createContainerOptions (bind + WorkingDir for Minecraft) ====================== */
+/* ====================== UPDATED createContainerOptions ====================== */
 const createContainerOptions = (config, volumePath) => {
   const networkMode = process.platform === "win32" ? "bridge" : "host";
 
   const hostConfig = {
-    Binds: [`${volumePath}:/data`], // CHANGED – matches your template's /data paths
+    Binds: [`${volumePath}:/data`],
     Memory: config.Memory * 1024 * 1024,
     CpuCount: config.Cpu,
     NetworkMode: networkMode,
@@ -183,16 +186,13 @@ const createContainerOptions = (config, volumePath) => {
 
   if (networkMode !== "host" && config.PortBindings) {
     hostConfig.PortBindings = config.PortBindings;
-    log.info(`[Wings] PortBindings enabled (bridge mode)`);
-  } else if (networkMode === "host") {
-    log.info(`[Wings] Host network mode active → PortBindings skipped (Docker requirement)`);
   }
 
   return {
     name: config.Id,
     Image: config.Image,
     ExposedPorts: config.Ports,
-    WorkingDir: "/data", // ADDED – java -jar runs from the correct folder
+    WorkingDir: "/data",
     AttachStdout: true,
     AttachStderr: true,
     AttachStdin: true,
@@ -217,7 +217,6 @@ const createContainer = async (req, res) => {
       primaryPort = firstBinding[0].HostPort;
     }
   }
-  log.info(`[Wings] Using primaryPort: ${primaryPort}`);
 
   let parsedVariables = variables || {};
   if (typeof variables === "string") {
@@ -234,9 +233,9 @@ const createContainer = async (req, res) => {
 
     await updateState(Id, "INSTALLING", null, Disk || 0);
 
-    // NEW: Execute your template's install_steps (download jar + eula + echo) BEFORE container creation
+    // NEW: Execute your template's install_steps BEFORE container creation
     if (InstallSteps && Array.isArray(InstallSteps)) {
-      log.info(`[Wings] Executing new install_steps (your Paper template)...`);
+      log.info(`[Wings] Executing new install_steps (Paper template)...`);
       await executeInstallSteps(InstallSteps, volumePath, parsedVariables);
     }
 
@@ -273,7 +272,7 @@ const createContainer = async (req, res) => {
       containerId: container.id,
     });
 
-    // LEGACY support (old templates with Scripts) – still runs after create
+    // LEGACY support (old templates with Scripts)
     if (Scripts && Scripts.Install && Array.isArray(Scripts.Install)) {
       log.info(`[Wings] Downloading legacy install scripts...`);
       await downloadInstallScripts(Scripts.Install, volumePath, variables || {});
@@ -287,8 +286,14 @@ const createContainer = async (req, res) => {
       await replaceVariables(volumePath, replaceVars);
     }
 
-    await updateState(Id, "READY", container.id, Disk || 0);
-    log.info(`[Wings] === DEPLOYMENT COMPLETED SUCCESSFULLY ===`);
+    // ====================== FIX FOR START/RESTART/STOP BUTTONS ======================
+    // Container must be running for custom actions (run_code) and power buttons to work
+    // But we set state = "STOPPED" so Minecraft does NOT auto-start
+    log.info(`[Wings] Starting container idle (no java process yet)...`);
+    await container.start();
+
+    await updateState(Id, "STOPPED", container.id, Disk || 0);
+    log.info(`[Wings] === DEPLOYMENT COMPLETED (installed + container running idle, server STOPPED) ===`);
 
   } catch (err) {
     log.error(`[Wings] DEPLOYMENT FAILED: ${err.message}`);
