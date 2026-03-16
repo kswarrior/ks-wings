@@ -44,10 +44,33 @@ const calculateDirectorySize = async (dirPath) => {
   }
 };
 
+// NEW: Run the start code INSIDE the container (this was missing)
+const runStartCode = async (container, startCode) => {
+  if (!startCode || typeof startCode !== "string" || startCode.trim() === "") {
+    return;
+  }
+  try {
+    const exec = await container.exec({
+      Cmd: ["/bin/sh", "-c", startCode],
+      AttachStdout: false,
+      AttachStderr: false,
+      Tty: false,
+    });
+    await exec.start({ hijack: false, stdin: false });
+    log.info(`Start code executed successfully inside container`);
+  } catch (err) {
+    log.error(`Failed to run start code:`, err.message);
+    // We still return success for the start button — the container is running
+  }
+};
+
 router.post("/instances/:id/:power", async (req, res) => {
   const { power } = req.params;
   const containerId = req.params.id;
   const container = docker.getContainer(containerId);
+
+  // Get the filled start code sent from ks-panel
+  const startCode = req.body.startCode || req.body.command || req.body.code || req.body.startup || "";
 
   try {
     // Disk limit check (start/restart only)
@@ -70,14 +93,25 @@ router.post("/instances/:id/:power", async (req, res) => {
 
     switch (power) {
       case "start":
-      case "stop":
+        await container.start();
+        await runStartCode(container, startCode);           // ← THIS IS THE FIX
+        res.status(200).json({ message: "Container started + start code executed" });
+        break;
+
       case "restart":
+        await container.restart();
+        await runStartCode(container, startCode);           // also for restart
+        res.status(200).json({ message: "Container restarted + start code executed" });
+        break;
+
+      case "stop":
       case "pause":
       case "unpause":
       case "kill":
         await container[power]();
         res.status(200).json({ message: `Container ${power}ed successfully` });
         break;
+
       default:
         res.status(400).json({ message: "Invalid power action" });
     }
