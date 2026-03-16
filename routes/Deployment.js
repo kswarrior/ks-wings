@@ -286,12 +286,6 @@ const createContainer = async (req, res) => {
       await replaceVariables(volumePath, replaceVars);
     }
 
-    // ====================== FIX FOR START/RESTART/STOP BUTTONS ======================
-    // Container must be running for custom actions (run_code) and power buttons to work
-    // But we set state = "STOPPED" so Minecraft does NOT auto-start
-    log.info(`[Wings] Starting container idle (no java process yet)...`);
-    await container.start();
-
     await updateState(Id, "STOPPED", container.id, Disk || 0);
     log.info(`[Wings] === DEPLOYMENT COMPLETED (installed + container running idle, server STOPPED) ===`);
 
