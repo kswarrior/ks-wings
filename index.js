@@ -217,9 +217,15 @@ async function streamDockerLogs(ws, container) {
     }
 
     logStream.on("data", (chunk) => {
+      // === ONLY CHANGE: Strip Docker's 8-byte binary header (stdout/stderr frame) ===
+      // This is the exact reason server logs were invisible/garbage before
+      let content = chunk.length > 8 
+        ? chunk.slice(8).toString('utf8') 
+        : chunk.toString('utf8');
+
       const logMessage = {
         timestamp: new Date().toISOString(),
-        content: chunk.toString(),
+        content: content,
       };
       containerLogs[containerId].push(logMessage);
       const formattedMessage = formatLogMessage(logMessage);
