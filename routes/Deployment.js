@@ -287,7 +287,6 @@ const createContainer = async (req, res) => {
       await replaceVariables(volumePath, replaceVars);
     }
 
-    await container.start();
     await updateState(Id, "READY", container.id, Disk || 0);
     log.info(`[Wings] === DEPLOYMENT COMPLETED SUCCESSFULLY ===`);
 
@@ -404,7 +403,6 @@ const redeployContainer = async (req, res) => {
     );
 
     const newContainer = await docker.createContainer(containerOptions);
-    await newContainer.start();
     res.status(200).json({
       message: "Container redeployed successfully",
       containerId: newContainer.id,
@@ -495,7 +493,6 @@ const reinstallContainer = async (req, res) => {
       await replaceVariables(dir, variables);
     }
 
-    await newContainer.start();
     res.status(200).json({
       message: "Container reinstalled successfully",
       containerId: newContainer.id,
@@ -538,7 +535,6 @@ const editContainer = async (req, res) => {
     await container.remove();
     log.info("Creating new container with updated configuration");
     const newContainer = await docker.createContainer(newContainerOptions);
-    await newContainer.start();
 
     log.info(`Edit completed! New container ID: ${newContainer.id}`);
     res.status(200).json({
