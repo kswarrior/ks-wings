@@ -1,22 +1,38 @@
+/**
+ * @fileoverview Handles container power management actions via Docker.
+ */
+
 const express = require("express");
 const router = express.Router();
 const Docker = require("../utils/Docker");
-const docker = new Docker({ socketPath: process.env.dockerSocket });
-const fs = require("fs").promises;
-const fsSync = require("fs");
+const fs = require("fs");
 const path = require("path");
-const util = require("util");
-const execAsync = util.promisify(require("child_process").exec);
+const { calculateDirectorySize } = require("../utils/FileType");
 
-const CatLoggr = require("cat-loggr");
-const log = new CatLoggr();
+const docker = new Docker({ socketPath: process.env.dockerSocket });
 
-const statesFilePath = path.join(__dirname, "../storage/states.json");
+/**
+ * Reads the disk limit and volume ID association from states.json
+ */
+function getStateForContainer(containerId) {
+  const statesFilePath = path.join(__dirname, "../storage/states.json");
+  try {
+    if (fs.existsSync(statesFilePath)) {
+      const statesData = JSON.parse(fs.readFileSync(statesFilePath, "utf8"));
+      for (const [volumeId, state] of Object.entries(statesData)) {
+        if (state.containerId === containerId) {
+          return { volumeId, ...state };
+        }
+      }
+    }
+  } catch (err) {
+    console.warn("Failed to read states:", err.message);
+  }
+  return null;
+}
 
-// ... (keep your readStates, getStateForContainer, calculateDirectorySize exactly as-is)
-
-// NEW: Run the start code INSIDE the container (your fix)
-const runStartCode = async (container, startCode) => {
+// ====================== NEW: Auto-run template start code ======================
+async function runStartCode(container, startCode) {
   if (!startCode || typeof startCode !== "string" || startCode.trim() === "") {
     return;
   }
@@ -28,14 +44,14 @@ const runStartCode = async (container, startCode) => {
       Tty: false,
     });
     await exec.start({ hijack: false, stdin: false });
-    log.info(`Start code executed successfully inside container`);
+    console.log(`[KS Wings] Start code executed successfully inside container`);
   } catch (err) {
-    log.error(`Failed to run start code:`, err.message);
+    console.error(`[KS Wings] Failed to run start code:`, err.message);
   }
-};
+}
 
-// NEW: Graceful runcode for stop (MC "stop" command etc.)
-const runCode = async (container, command) => {
+// ====================== NEW: Graceful stop (e.g. "stop" command for Minecraft) ======================
+async function runStopCode(container, command) {
   if (!command || typeof command !== "string") return;
   try {
     const exec = await container.exec({
@@ -44,27 +60,79 @@ const runCode = async (container, command) => {
       AttachStderr: true,
       Tty: false,
     });
-    const stream = await exec.start({ hijack: false, stdin: false });
-    log.info(`Runcode executed: ${command}`);
+    await exec.start({ hijack: false, stdin: false });
+    console.log(`[KS Wings] Stop command executed: ${command}`);
   } catch (err) {
-    log.error(`Runcode failed:`, err.message);
+    console.error(`[KS Wings] Run stop code failed:`, err.message);
   }
-};
+}
 
-router.post("/instances/:id/:power", async (req, res) => { ... // keep your existing start/restart/stop logic exactly
-  // (your disk check + switch with runStartCode for start/restart)
-});
-
-router.post("/instances/:id/runcode", async (req, res) => {  // ← NEW endpoint for stop
+// ====================== MAIN POWER ROUTE ======================
+router.post("/instances/:id/:power", async (req, res) => {
+  const { power } = req.params;
   const containerId = req.params.id;
-  const command = req.body.command;
   const container = docker.getContainer(containerId);
 
   try {
-    await runCode(container, command);
-    res.status(200).json({ message: "Command executed successfully" });
+    // Disk limit check (original behaviour)
+    if (power === "start" || power === "restart") {
+      const state = getStateForContainer(containerId);
+      if (state && state.diskLimit && state.diskLimit > 0) {
+        const volumePath = path.join(__dirname, "../volumes", state.volumeId);
+        try {
+          const currentSize = await calculateDirectorySize(volumePath);
+          const currentSizeMiB = currentSize / (1024 * 1024);
+          if (currentSizeMiB >= state.diskLimit) {
+            return res.status(403).json({
+              message: "Cannot start server: storage limit exceeded. Please delete some files or increase your disk limit.",
+              currentUsageMiB: Math.round(currentSizeMiB),
+              limitMiB: state.diskLimit
+            });
+          }
+        } catch (sizeErr) {
+          console.warn("Could not calculate volume size:", sizeErr.message);
+        }
+      }
+    }
+
+    switch (power) {
+      case "start":
+      case "restart":
+        await container[power]();
+        // Automatically run the start code from your template
+        const startCode = req.body.startCode || "";
+        await runStartCode(container, startCode);
+        res.status(200).json({ message: `Container ${power}ed successfully` });
+        break;
+
+      case "stop":
+        const stopCommand = req.body.command || "";
+        if (stopCommand) {
+          await runStopCode(container, stopCommand);
+          res.status(200).json({ message: "Stop command sent successfully" });
+        } else {
+          await container.stop();
+          res.status(200).json({ message: `Container stopped successfully` });
+        }
+        break;
+
+      case "pause":
+      case "unpause":
+      case "kill":
+        await container[power]();
+        res.status(200).json({ message: `Container ${power}ed successfully` });
+        break;
+
+      default:
+        res.status(400).json({ message: "Invalid power action" });
+    }
   } catch (err) {
-    res.status(500).json({ message: err.message });
+    if (err.statusCode === 304) {
+      res.status(304).json({ message: err.message });
+    } else {
+      console.error("Power action failed:", err.message);
+      res.status(500).json({ message: err.message });
+    }
   }
 });
 
