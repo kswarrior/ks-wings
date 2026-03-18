@@ -1,24 +1,21 @@
-/**
- * @fileoverview Handles container power management actions via Docker.
- */
-
 const express = require("express");
 const router = express.Router();
 const Docker = require("../utils/Docker");
-const fs = require("fs");
+const docker = new Docker({ socketPath: process.env.dockerSocket });
+const fs = require("fs").promises;
+const fsSync = require("fs");
 const path = require("path");
 const { calculateDirectorySize } = require("../utils/FileType");
+const CatLoggr = require("cat-loggr");
+const log = new CatLoggr();
 
-const docker = new Docker({ socketPath: process.env.dockerSocket });
+const statesFilePath = path.join(__dirname, "../storage/states.json");
 
-/**
- * Reads the disk limit and volume ID association from states.json
- */
+// ==================== READ STATES (original logic) ====================
 function getStateForContainer(containerId) {
-  const statesFilePath = path.join(__dirname, "../storage/states.json");
   try {
-    if (fs.existsSync(statesFilePath)) {
-      const statesData = JSON.parse(fs.readFileSync(statesFilePath, "utf8"));
+    if (fsSync.existsSync(statesFilePath)) {
+      const statesData = JSON.parse(fsSync.readFileSync(statesFilePath, "utf8"));
       for (const [volumeId, state] of Object.entries(statesData)) {
         if (state.containerId === containerId) {
           return { volumeId, ...state };
@@ -26,16 +23,14 @@ function getStateForContainer(containerId) {
       }
     }
   } catch (err) {
-    console.warn("Failed to read states:", err.message);
+    log.warn("Failed to read states.json:", err.message);
   }
   return null;
 }
 
-// ====================== NEW: Auto-run template start code ======================
-async function runStartCode(container, startCode) {
-  if (!startCode || typeof startCode !== "string" || startCode.trim() === "") {
-    return;
-  }
+// ==================== AUTO-RUN TEMPLATE START CODE ====================
+const runStartCode = async (container, startCode) => {
+  if (!startCode || typeof startCode !== "string" || startCode.trim() === "") return;
   try {
     const exec = await container.exec({
       Cmd: ["/bin/sh", "-c", startCode],
@@ -44,14 +39,14 @@ async function runStartCode(container, startCode) {
       Tty: false,
     });
     await exec.start({ hijack: false, stdin: false });
-    console.log(`[KS Wings] Start code executed successfully inside container`);
+    log.info(`[KS Wings] Template start code executed successfully`);
   } catch (err) {
-    console.error(`[KS Wings] Failed to run start code:`, err.message);
+    log.error(`[KS Wings] Failed to run start code:`, err.message);
   }
-}
+};
 
-// ====================== NEW: Graceful stop (e.g. "stop" command for Minecraft) ======================
-async function runStopCode(container, command) {
+// ==================== GRACEFUL STOP COMMAND (Minecraft "stop" etc.) ====================
+const runStopCode = async (container, command) => {
   if (!command || typeof command !== "string") return;
   try {
     const exec = await container.exec({
@@ -61,36 +56,32 @@ async function runStopCode(container, command) {
       Tty: false,
     });
     await exec.start({ hijack: false, stdin: false });
-    console.log(`[KS Wings] Stop command executed: ${command}`);
+    log.info(`[KS Wings] Stop command executed: ${command}`);
   } catch (err) {
-    console.error(`[KS Wings] Run stop code failed:`, err.message);
+    log.error(`[KS Wings] Stop command failed:`, err.message);
   }
-}
+};
 
-// ====================== MAIN POWER ROUTE ======================
+// ==================== MAIN POWER ROUTE (start/restart/stop) ====================
 router.post("/instances/:id/:power", async (req, res) => {
-  const { power } = req.params;
   const containerId = req.params.id;
+  const power = req.params.power;
   const container = docker.getContainer(containerId);
 
   try {
-    // Disk limit check (original behaviour)
+    // Disk limit check (original KS Wings behaviour)
     if (power === "start" || power === "restart") {
       const state = getStateForContainer(containerId);
       if (state && state.diskLimit && state.diskLimit > 0) {
         const volumePath = path.join(__dirname, "../volumes", state.volumeId);
-        try {
-          const currentSize = await calculateDirectorySize(volumePath);
-          const currentSizeMiB = currentSize / (1024 * 1024);
-          if (currentSizeMiB >= state.diskLimit) {
-            return res.status(403).json({
-              message: "Cannot start server: storage limit exceeded. Please delete some files or increase your disk limit.",
-              currentUsageMiB: Math.round(currentSizeMiB),
-              limitMiB: state.diskLimit
-            });
-          }
-        } catch (sizeErr) {
-          console.warn("Could not calculate volume size:", sizeErr.message);
+        const currentSize = await calculateDirectorySize(volumePath);
+        const currentSizeMiB = currentSize / (1024 * 1024);
+        if (currentSizeMiB >= state.diskLimit) {
+          return res.status(403).json({
+            message: "Cannot start: storage limit exceeded.",
+            currentUsageMiB: Math.round(currentSizeMiB),
+            limitMiB: state.diskLimit
+          });
         }
       }
     }
@@ -99,40 +90,43 @@ router.post("/instances/:id/:power", async (req, res) => {
       case "start":
       case "restart":
         await container[power]();
-        // Automatically run the start code from your template
         const startCode = req.body.startCode || "";
         await runStartCode(container, startCode);
-        res.status(200).json({ message: `Container ${power}ed successfully` });
+        res.json({ message: `Container ${power}ed + template code executed` });
         break;
 
       case "stop":
         const stopCommand = req.body.command || "";
-        if (stopCommand) {
-          await runStopCode(container, stopCommand);
-          res.status(200).json({ message: "Stop command sent successfully" });
-        } else {
-          await container.stop();
-          res.status(200).json({ message: `Container stopped successfully` });
-        }
-        break;
-
-      case "pause":
-      case "unpause":
-      case "kill":
-        await container[power]();
-        res.status(200).json({ message: `Container ${power}ed successfully` });
+        if (stopCommand) await runStopCode(container, stopCommand);
+        else await container.stop();
+        res.json({ message: "Container stopped successfully" });
         break;
 
       default:
         res.status(400).json({ message: "Invalid power action" });
     }
   } catch (err) {
+    log.error("Power action failed:", err.message);
     if (err.statusCode === 304) {
       res.status(304).json({ message: err.message });
     } else {
-      console.error("Power action failed:", err.message);
       res.status(500).json({ message: err.message });
     }
+  }
+});
+
+// ==================== /runcode route (used by current panel for STOP) ====================
+router.post("/instances/:id/runcode", async (req, res) => {
+  const containerId = req.params.id;
+  const command = req.body.command;
+  const container = docker.getContainer(containerId);
+
+  try {
+    await runStopCode(container, command);
+    res.json({ message: "Command executed successfully inside container" });
+  } catch (err) {
+    log.error("Runcode failed:", err.message);
+    res.status(500).json({ message: err.message });
   }
 });
 
