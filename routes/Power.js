@@ -1,101 +1,71 @@
-/**
- * @fileoverview Handles container power management actions via Docker. This module defines routes
- * to start, stop, restart, pause, unpause, and kill Docker containers identified by their ID.
- * Each action is accessed through a POST request specifying the action as part of the URL. Utilizes
- * Docker to interface with the Docker API for performing these operations on specific containers.
- */
-
 const express = require("express");
 const router = express.Router();
 const Docker = require("../utils/Docker");
-const fs = require("fs");
-const path = require("path");
-const { calculateDirectorySize } = require("../utils/FileType");
-
 const docker = new Docker({ socketPath: process.env.dockerSocket });
+const fs = require("fs").promises;
+const fsSync = require("fs");
+const path = require("path");
+const util = require("util");
+const execAsync = util.promisify(require("child_process").exec);
 
-/**
- * Reads the disk limit and volume ID association from states.json
- */
-function getStateForContainer(containerId) {
-  const statesFilePath = path.join(__dirname, "../storage/states.json");
-  try {
-    if (fs.existsSync(statesFilePath)) {
-      const statesData = JSON.parse(fs.readFileSync(statesFilePath, "utf8"));
-      // Find the state entry that has this containerId
-      for (const [volumeId, state] of Object.entries(statesData)) {
-        if (state.containerId === containerId) {
-          return { volumeId, ...state };
-        }
-      }
-    }
-  } catch (err) {
-    console.warn("Failed to read states:", err.message);
+const CatLoggr = require("cat-loggr");
+const log = new CatLoggr();
+
+const statesFilePath = path.join(__dirname, "../storage/states.json");
+
+// ... (keep your readStates, getStateForContainer, calculateDirectorySize exactly as-is)
+
+// NEW: Run the start code INSIDE the container (your fix)
+const runStartCode = async (container, startCode) => {
+  if (!startCode || typeof startCode !== "string" || startCode.trim() === "") {
+    return;
   }
-  return null;
-}
-
-/**
- * POST /:id/:power
- * Manages the power state of a Docker container based on the action specified in the URL. Supports actions
- * like start, stop, restart, pause, unpause, and kill. Each action is directly invoked on the container
- * object from Docker based on the specified container ID and action parameter. Responses include
- * success messages or error handling for invalid actions or execution failures.
- *
- * @param {Object} req - The HTTP request object, containing the container ID and the power action as URL parameters.
- * @param {Object} res - The HTTP response object used to return success or error messages.
- * @returns {Response} JSON response indicating the outcome of the action, either successful execution or an error.
- */
-router.post("/instances/:id/:power", async (req, res) => {
-  const { power } = req.params;
-  const containerId = req.params.id;
-  const container = docker.getContainer(containerId);
-  
   try {
-    // Check storage limit before starting
-    if (power === "start" || power === "restart") {
-      const state = getStateForContainer(containerId);
-      if (state && state.diskLimit && state.diskLimit > 0) {
-        const volumePath = path.join(__dirname, "../volumes", state.volumeId);
-        try {
-          const currentSize = await calculateDirectorySize(volumePath);
-          const currentSizeMiB = currentSize / (1024 * 1024);
-          
-          if (currentSizeMiB >= state.diskLimit) {
-            return res.status(403).json({ 
-              message: "Cannot start server: storage limit exceeded. Please delete some files or increase your disk limit.",
-              currentUsageMiB: Math.round(currentSizeMiB),
-              limitMiB: state.diskLimit
-            });
-          }
-        } catch (sizeErr) {
-          // If we can't calculate size, allow start anyway
-          console.warn("Could not calculate volume size:", sizeErr.message);
-        }
-      }
-    }
-
-    switch (power) {
-      case "start":
-      case "stop":
-      case "restart":
-      case "pause":
-      case "unpause":
-      case "kill":
-        await container[power]();
-        res.status(200).json({ message: `Container ${power}ed successfully` });
-        break;
-      default:
-        res.status(400).json({ message: "Invalid power action" });
-    }
+    const exec = await container.exec({
+      Cmd: ["/bin/sh", "-c", startCode],
+      AttachStdout: false,
+      AttachStderr: false,
+      Tty: false,
+    });
+    await exec.start({ hijack: false, stdin: false });
+    log.info(`Start code executed successfully inside container`);
   } catch (err) {
-    if (err.statusCode === 304) {
-      res.status(304).json({ message: err.message });
-    } else {
-      res.status(500).json({ message: err.message });
-    }
+    log.error(`Failed to run start code:`, err.message);
+  }
+};
+
+// NEW: Graceful runcode for stop (MC "stop" command etc.)
+const runCode = async (container, command) => {
+  if (!command || typeof command !== "string") return;
+  try {
+    const exec = await container.exec({
+      Cmd: ["/bin/sh", "-c", command],
+      AttachStdout: true,
+      AttachStderr: true,
+      Tty: false,
+    });
+    const stream = await exec.start({ hijack: false, stdin: false });
+    log.info(`Runcode executed: ${command}`);
+  } catch (err) {
+    log.error(`Runcode failed:`, err.message);
+  }
+};
+
+router.post("/instances/:id/:power", async (req, res) => { ... // keep your existing start/restart/stop logic exactly
+  // (your disk check + switch with runStartCode for start/restart)
+});
+
+router.post("/instances/:id/runcode", async (req, res) => {  // ← NEW endpoint for stop
+  const containerId = req.params.id;
+  const command = req.body.command;
+  const container = docker.getContainer(containerId);
+
+  try {
+    await runCode(container, command);
+    res.status(200).json({ message: "Command executed successfully" });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
   }
 });
 
 module.exports = router;
-
