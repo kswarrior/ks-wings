@@ -97,8 +97,12 @@ router.post("/instances/:id/:power", async (req, res) => {
 
       case "stop":
         const stopCommand = req.body.command || "";
-        if (stopCommand) await runStopCode(container, stopCommand);
-        else await container.stop();
+        // Always attempt graceful stop first (for templates that use StopCommand like Minecraft "stop")
+        if (stopCommand) {
+          await runStopCode(container, stopCommand);
+        }
+        // THEN force Docker stop (this was the missing piece — previous if/else meant container never stopped)
+        await container.stop();
         res.json({ message: "Container stopped successfully" });
         break;
 
@@ -115,7 +119,7 @@ router.post("/instances/:id/:power", async (req, res) => {
   }
 });
 
-// ==================== /runcode route (used by current panel for STOP) ====================
+// ==================== /runcode route (legacy — kept for compatibility) ====================
 router.post("/instances/:id/runcode", async (req, res) => {
   const containerId = req.params.id;
   const command = req.body.command;
