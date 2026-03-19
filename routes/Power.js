@@ -11,7 +11,7 @@ const log = new CatLoggr();
 
 const statesFilePath = path.join(__dirname, "../storage/states.json");
 
-// ==================== READ STATES (original logic) ====================
+// ==================== READ STATES ====================
 function getStateForContainer(containerId) {
   try {
     if (fsSync.existsSync(statesFilePath)) {
@@ -45,23 +45,20 @@ const runStartCode = async (container, startCode) => {
   }
 };
 
-// ==================== GRACEFUL STOP COMMAND (FIXED — no more hang) ====================
-// Changed Attach to false + removed stream (same as runStartCode)
-// This was the exact cause of the 524 timeout
+// ==================== GRACEFUL STOP COMMAND (FIXED — no hang) ====================
 const runStopCode = async (container, command) => {
   if (!command || typeof command !== "string" || command.trim() === "") return;
   try {
     const exec = await container.exec({
       Cmd: ["/bin/sh", "-c", command],
-      AttachStdout: false,   // ← FIXED
-      AttachStderr: false,   // ← FIXED
+      AttachStdout: false,   // ← This was the hang cause
+      AttachStderr: false,
       Tty: false,
     });
     await exec.start({ hijack: false, stdin: false });
     log.info(`[KS Wings] Stop command executed: ${command}`);
   } catch (err) {
     log.error(`[KS Wings] Stop command failed:`, err.message);
-    // We continue anyway — the Docker stop below will still work
   }
 };
 
@@ -72,7 +69,6 @@ router.post("/instances/:id/:power", async (req, res) => {
   const container = docker.getContainer(containerId);
 
   try {
-    // Disk limit check (unchanged)
     if (power === "start" || power === "restart") {
       const state = getStateForContainer(containerId);
       if (state && state.diskLimit && state.diskLimit > 0) {
@@ -101,7 +97,7 @@ router.post("/instances/:id/:power", async (req, res) => {
       case "stop":
         const stopCommand = req.body.command || "";
         if (stopCommand) await runStopCode(container, stopCommand);
-        await container.stop({ t: 10 }); // explicit 10s timeout (safer)
+        await container.stop({ t: 10 });
         res.json({ message: "Container stopped successfully" });
         break;
 
@@ -118,7 +114,7 @@ router.post("/instances/:id/:power", async (req, res) => {
   }
 });
 
-// ==================== /runcode route (legacy — also fixed) ====================
+// Legacy /runcode (kept for old compatibility)
 router.post("/instances/:id/runcode", async (req, res) => {
   const containerId = req.params.id;
   const command = req.body.command;
