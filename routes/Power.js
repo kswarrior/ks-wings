@@ -94,12 +94,15 @@ router.post("/instances/:id/:power", async (req, res) => {
         res.json({ message: `Container ${power}ed + template code executed` });
         break;
 
-      case "stop":
-        const stopCommand = req.body.command || "";
-        if (stopCommand) await runStopCode(container, stopCommand);
-        await container.stop({ t: 10 });
-        res.json({ message: "Container stopped successfully" });
-        break;
+    case "stop":
+      const stopCommand = req.body.command || "";
+      if (stopCommand && stopCommand.trim() !== "") {
+        await runStopCode(container, stopCommand);
+      }
+      await container.stop({ t: 10 });
+      res.json({ message: "Container stopped successfully" });
+      break;
+
 
       default:
         res.status(400).json({ message: "Invalid power action" });
