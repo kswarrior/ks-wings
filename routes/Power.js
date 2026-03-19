@@ -28,7 +28,7 @@ function getStateForContainer(containerId) {
   return null;
 }
 
-// ==================== AUTO-RUN TEMPLATE START CODE ====================
+// ==================== AUTO-RUN TEMPLATE START CODE (safe) ====================
 const runStartCode = async (container, startCode) => {
   if (!startCode || typeof startCode !== "string" || startCode.trim() === "") return;
   try {
@@ -45,31 +45,34 @@ const runStartCode = async (container, startCode) => {
   }
 };
 
-// ==================== GRACEFUL STOP COMMAND (Minecraft "stop" etc.) ====================
+// ==================== GRACEFUL STOP COMMAND (FIXED — no more hang) ====================
+// Changed Attach to false + removed stream (same as runStartCode)
+// This was the exact cause of the 524 timeout
 const runStopCode = async (container, command) => {
-  if (!command || typeof command !== "string") return;
+  if (!command || typeof command !== "string" || command.trim() === "") return;
   try {
     const exec = await container.exec({
       Cmd: ["/bin/sh", "-c", command],
-      AttachStdout: true,
-      AttachStderr: true,
+      AttachStdout: false,   // ← FIXED
+      AttachStderr: false,   // ← FIXED
       Tty: false,
     });
     await exec.start({ hijack: false, stdin: false });
     log.info(`[KS Wings] Stop command executed: ${command}`);
   } catch (err) {
     log.error(`[KS Wings] Stop command failed:`, err.message);
+    // We continue anyway — the Docker stop below will still work
   }
 };
 
-// ==================== MAIN POWER ROUTE (start/restart/stop) ====================
+// ==================== MAIN POWER ROUTE ====================
 router.post("/instances/:id/:power", async (req, res) => {
   const containerId = req.params.id;
   const power = req.params.power;
   const container = docker.getContainer(containerId);
 
   try {
-    // Disk limit check (original KS Wings behaviour)
+    // Disk limit check (unchanged)
     if (power === "start" || power === "restart") {
       const state = getStateForContainer(containerId);
       if (state && state.diskLimit && state.diskLimit > 0) {
@@ -97,12 +100,8 @@ router.post("/instances/:id/:power", async (req, res) => {
 
       case "stop":
         const stopCommand = req.body.command || "";
-        // Always attempt graceful stop first (for templates that use StopCommand like Minecraft "stop")
-        if (stopCommand) {
-          await runStopCode(container, stopCommand);
-        }
-        // THEN force Docker stop (this was the missing piece — previous if/else meant container never stopped)
-        await container.stop();
+        if (stopCommand) await runStopCode(container, stopCommand);
+        await container.stop({ t: 10 }); // explicit 10s timeout (safer)
         res.json({ message: "Container stopped successfully" });
         break;
 
@@ -119,7 +118,7 @@ router.post("/instances/:id/:power", async (req, res) => {
   }
 });
 
-// ==================== /runcode route (legacy — kept for compatibility) ====================
+// ==================== /runcode route (legacy — also fixed) ====================
 router.post("/instances/:id/runcode", async (req, res) => {
   const containerId = req.params.id;
   const command = req.body.command;
