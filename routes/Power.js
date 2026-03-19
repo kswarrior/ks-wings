@@ -37,9 +37,10 @@ const runStartCode = async (container, startCode) => {
       AttachStdout: false,
       AttachStderr: false,
       Tty: false,
+      WorkingDir: "/data"                    // ← FIXED: runs in correct folder
     });
-    await exec.start({ Detach: true, Tty: false });   // ← FIXED: correct Docker API keys
-    log.info(`[KS Wings] Template start code executed successfully`);
+    await exec.start({ Detach: true, Tty: false });
+    log.info(`[KS Wings] Template start code executed successfully in /data`);
   } catch (err) {
     log.error(`[KS Wings] Failed to run start code:`, err.message);
   }
@@ -54,8 +55,9 @@ const runStopCode = async (container, command) => {
       AttachStdout: false,
       AttachStderr: false,
       Tty: false,
+      WorkingDir: "/data"                    // ← FIXED: runs in correct folder
     });
-    await exec.start({ Detach: true, Tty: false });   // ← FIXED: correct Docker API keys
+    await exec.start({ Detach: true, Tty: false });
     log.info(`[KS Wings] Stop command executed: ${command}`);
   } catch (err) {
     log.error(`[KS Wings] Stop command failed:`, err.message);
