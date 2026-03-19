@@ -132,7 +132,6 @@ class Docker {
     return new Container(this, response.Id);
   }
 
-  // ==================== FIXED LIST METHODS (used in /stats) ====================
   async listContainers(options = {}) {
     const qs = new URLSearchParams();
     if (options.all !== undefined) qs.set("all", options.all ? "1" : "0");
@@ -160,7 +159,6 @@ class Container {
     this.id = id;
   }
 
-  // inspect supports old callback style + modern await (compatibility)
   inspect(callback) {
     const promise = this.docker._request("GET", `/containers/${this.id}/json`);
     if (typeof callback === "function") {
