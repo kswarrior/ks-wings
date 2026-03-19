@@ -84,7 +84,7 @@ class Docker {
 
       const req = http.request(options, (res) => {
         if (res.statusCode >= 200 && res.statusCode < 300) {
-          resolve(res);   // ← returns real stream (fixes "stream.on is not a function")
+          resolve(res);
         } else {
           let data = "";
           res.on("data", (chunk) => (data += chunk));
@@ -129,19 +129,29 @@ class Docker {
     if (!response?.Id) {
       throw new Error(`Container creation failed: ${JSON.stringify(response)}`);
     }
-    return new Container(this, response.Id);   // ← returns real Container instance (fixes .id undefined)
+    return new Container(this, response.Id);
   }
 
-  // ==================== REST UNCHANGED ====================
-  async ping() { return this._request("GET", "/_ping", null, false); }
-  async info() { return this._request("GET", "/info"); }
-  async version() { return this._request("GET", "/version"); }
-  async listContainers(options = {}) { /* original */ }
-  getContainer(containerId) { return new Container(this, containerId); }
-  async listImages(options = {}) { /* original */ }
+  // ==================== FIXED LIST METHODS (used in /stats) ====================
+  async listContainers(options = {}) {
+    const qs = new URLSearchParams();
+    if (options.all !== undefined) qs.set("all", options.all ? "1" : "0");
+    const query = qs.toString() ? "?" + qs.toString() : "";
+    return this._request("GET", `/containers/json${query}`);
+  }
+
+  async listImages(options = {}) {
+    return this._request("GET", "/images/json");
+  }
+
   async listNetworks() { return this._request("GET", "/networks"); }
   async createNetwork(config) { return this._request("POST", "/networks/create", config); }
   async removeNetwork(networkId) { return this._request("DELETE", `/networks/${networkId}`, null, false); }
+  async ping() { return this._request("GET", "/_ping", null, false); }
+  async info() { return this._request("GET", "/info"); }
+  async version() { return this._request("GET", "/version"); }
+
+  getContainer(containerId) { return new Container(this, containerId); }
 }
 
 class Container {
@@ -149,24 +159,152 @@ class Container {
     this.docker = docker;
     this.id = id;
   }
-  inspect(callback) { /* original */ }
-  async start() { return this.docker._request("POST", `/containers/${this.id}/start`, null, false); }
-  async stop(options = {}) { /* original */ }
-  async restart(options = {}) { /* original */ }
-  async kill(options = {}) { /* original */ }
-  async pause() { /* original */ }
-  async unpause() { /* original */ }
-  async remove(options = {}) { /* original */ }
-  stats(options, callback) { /* original */ }
-  async logs(options = {}) { /* original */ }
-  async exec(options) { /* original */ }
-  async attach(options = {}) { /* original */ }
+
+  // inspect supports old callback style + modern await (compatibility)
+  inspect(callback) {
+    const promise = this.docker._request("GET", `/containers/${this.id}/json`);
+    if (typeof callback === "function") {
+      promise.then(r => callback(null, r)).catch(e => callback(e));
+      return;
+    }
+    return promise;
+  }
+
+  async start() {
+    return this.docker._request("POST", `/containers/${this.id}/start`, null, false);
+  }
+
+  async stop(options = {}) {
+    let path = `/containers/${this.id}/stop`;
+    if (options.t !== undefined) path += `?t=${options.t}`;
+    return this.docker._request("POST", path, null, false);
+  }
+
+  async restart(options = {}) {
+    let path = `/containers/${this.id}/restart`;
+    if (options.t !== undefined) path += `?t=${options.t}`;
+    return this.docker._request("POST", path, null, false);
+  }
+
+  async kill(options = {}) {
+    let path = `/containers/${this.id}/kill`;
+    if (options.signal) path += `?signal=${options.signal}`;
+    return this.docker._request("POST", path, null, false);
+  }
+
+  async pause() {
+    return this.docker._request("POST", `/containers/${this.id}/pause`, null, false);
+  }
+
+  async unpause() {
+    return this.docker._request("POST", `/containers/${this.id}/unpause`, null, false);
+  }
+
+  async remove(options = {}) {
+    let path = `/containers/${this.id}`;
+    const params = [];
+    if (options.force) params.push("force=1");
+    if (options.v) params.push("v=1");
+    if (params.length) path += "?" + params.join("&");
+    return this.docker._request("DELETE", path, null, false);
+  }
+
+  async stats(options = {}) {
+    const qs = new URLSearchParams({ stream: options.stream !== false ? "1" : "0" }).toString();
+    const version = await this.docker._getApiVersion();
+    return new Promise((resolve, reject) => {
+      const req = http.request({
+        socketPath: this.docker.socketPath,
+        path: `/v${version}/containers/${this.id}/stats?${qs}`,
+        method: "GET"
+      }, (res) => {
+        if (res.statusCode >= 200 && res.statusCode < 300) resolve(res);
+        else {
+          let data = "";
+          res.on("data", chunk => data += chunk);
+          res.on("end", () => reject(new Error(`Stats error: ${res.statusCode} - ${data}`)));
+        }
+      });
+      req.on("error", reject);
+      req.end();
+    });
+  }
+
+  async logs(options = {}) {
+    const qs = new URLSearchParams({
+      follow: options.follow ? "1" : "0",
+      stdout: options.stdout !== false ? "1" : "0",
+      stderr: options.stderr !== false ? "1" : "0",
+      tail: options.tail !== undefined ? String(options.tail) : "all",
+      timestamps: options.timestamps ? "1" : "0"
+    }).toString();
+    const version = await this.docker._getApiVersion();
+    return new Promise((resolve, reject) => {
+      const req = http.request({
+        socketPath: this.docker.socketPath,
+        path: `/v${version}/containers/${this.id}/logs?${qs}`,
+        method: "GET"
+      }, (res) => {
+        if (res.statusCode >= 200 && res.statusCode < 300) resolve(res);
+        else {
+          let data = "";
+          res.on("data", chunk => data += chunk);
+          res.on("end", () => reject(new Error(`Logs error: ${res.statusCode} - ${data}`)));
+        }
+      });
+      req.on("error", reject);
+      req.end();
+    });
+  }
+
+  async exec(options) {
+    const response = await this.docker._request("POST", `/containers/${this.id}/exec`, options);
+    if (!response?.Id) {
+      throw new Error(`Exec creation failed: ${JSON.stringify(response)}`);
+    }
+    return new Exec(this.docker, response.Id);
+  }
+
+  async attach(options = {}) {
+    const qs = new URLSearchParams({
+      stream: "1",
+      stdout: "1",
+      stderr: "1",
+      stdin: options.stdin ? "1" : "0"
+    }).toString();
+    const version = await this.docker._getApiVersion();
+    return new Promise((resolve, reject) => {
+      const req = http.request({
+        socketPath: this.docker.socketPath,
+        path: `/v${version}/containers/${this.id}/attach?${qs}`,
+        method: "GET"
+      }, (res) => {
+        if (res.statusCode >= 200 && res.statusCode < 300) resolve(res);
+        else {
+          let data = "";
+          res.on("data", chunk => data += chunk);
+          res.on("end", () => reject(new Error(`Attach error: ${res.statusCode} - ${data}`)));
+        }
+      });
+      req.on("error", reject);
+      req.end();
+    });
+  }
 }
 
 class Exec {
-  constructor(docker, id) { this.docker = docker; this.id = id; }
-  async start(options = {}) { /* original */ }
-  async inspect() { return this.docker._request("GET", `/exec/${this.id}/json`); }
+  constructor(docker, id) {
+    this.docker = docker;
+    this.id = id;
+  }
+
+  async start(options = {}) {
+    return this.docker._request("POST", `/exec/${this.id}/start`, options, false);
+  }
+
+  async inspect() {
+    return this.docker._request("GET", `/exec/${this.id}/json`);
+  }
 }
 
 module.exports = Docker;
