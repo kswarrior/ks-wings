@@ -28,7 +28,7 @@ function getStateForContainer(containerId) {
   return null;
 }
 
-// ==================== AUTO-RUN TEMPLATE START CODE (safe) ====================
+// ==================== AUTO-RUN TEMPLATE START CODE ====================
 const runStartCode = async (container, startCode) => {
   if (!startCode || typeof startCode !== "string" || startCode.trim() === "") return;
   try {
@@ -38,24 +38,24 @@ const runStartCode = async (container, startCode) => {
       AttachStderr: false,
       Tty: false,
     });
-    await exec.start({ hijack: false, stdin: false });
+    await exec.start({ Detach: true, Tty: false });   // ← FIXED: correct Docker API keys
     log.info(`[KS Wings] Template start code executed successfully`);
   } catch (err) {
     log.error(`[KS Wings] Failed to run start code:`, err.message);
   }
 };
 
-// ==================== GRACEFUL STOP COMMAND (FIXED — no hang) ====================
+// ==================== GRACEFUL STOP COMMAND ====================
 const runStopCode = async (container, command) => {
   if (!command || typeof command !== "string" || command.trim() === "") return;
   try {
     const exec = await container.exec({
       Cmd: ["/bin/sh", "-c", command],
-      AttachStdout: false,   // ← This was the hang cause
+      AttachStdout: false,
       AttachStderr: false,
       Tty: false,
     });
-    await exec.start({ hijack: false, stdin: false });
+    await exec.start({ Detach: true, Tty: false });   // ← FIXED: correct Docker API keys
     log.info(`[KS Wings] Stop command executed: ${command}`);
   } catch (err) {
     log.error(`[KS Wings] Stop command failed:`, err.message);
@@ -94,15 +94,14 @@ router.post("/instances/:id/:power", async (req, res) => {
         res.json({ message: `Container ${power}ed + template code executed` });
         break;
 
-    case "stop":
-      const stopCommand = req.body.command || "";
-      if (stopCommand && stopCommand.trim() !== "") {
-        await runStopCode(container, stopCommand);
-      }
-      await container.stop({ t: 10 });
-      res.json({ message: "Container stopped successfully" });
-      break;
-
+      case "stop":
+        const stopCommand = req.body.command || "";
+        if (stopCommand && stopCommand.trim() !== "") {
+          await runStopCode(container, stopCommand);
+        }
+        await container.stop({ t: 10 });
+        res.json({ message: "Container stopped successfully" });
+        break;
 
       default:
         res.status(400).json({ message: "Invalid power action" });
@@ -117,7 +116,7 @@ router.post("/instances/:id/:power", async (req, res) => {
   }
 });
 
-// Legacy /runcode (kept for old compatibility)
+// Legacy /runcode
 router.post("/instances/:id/runcode", async (req, res) => {
   const containerId = req.params.id;
   const command = req.body.command;
