@@ -37,7 +37,7 @@ const runStartCode = async (container, startCode) => {
       AttachStdout: false,
       AttachStderr: false,
       Tty: false,
-      WorkingDir: "/data"
+      WorkingDir: "/data"                    // ← FIXED: runs in correct folder
     });
     await exec.start({ Detach: true, Tty: false });
     log.info(`[KS Wings] Template start code executed successfully in /data`);
@@ -55,7 +55,7 @@ const runStopCode = async (container, command) => {
       AttachStdout: false,
       AttachStderr: false,
       Tty: false,
-      WorkingDir: "/data"
+      WorkingDir: "/data"                    // ← FIXED: runs in correct folder
     });
     await exec.start({ Detach: true, Tty: false });
     log.info(`[KS Wings] Stop command executed: ${command}`);
