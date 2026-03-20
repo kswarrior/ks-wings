@@ -37,7 +37,7 @@ const runStartCode = async (container, startCode) => {
       AttachStdout: false,
       AttachStderr: false,
       Tty: false,
-      WorkingDir: "/data"                    // ← FIXED: runs in correct folder
+      WorkingDir: "/data"
     });
     await exec.start({ Detach: true, Tty: false });
     log.info(`[KS Wings] Template start code executed successfully in /data`);
@@ -55,7 +55,7 @@ const runStopCode = async (container, command) => {
       AttachStdout: false,
       AttachStderr: false,
       Tty: false,
-      WorkingDir: "/data"                    // ← FIXED: runs in correct folder
+      WorkingDir: "/data"
     });
     await exec.start({ Detach: true, Tty: false });
     log.info(`[KS Wings] Stop command executed: ${command}`);
@@ -92,25 +92,37 @@ router.post("/instances/:id/:power", async (req, res) => {
       case "restart":
         await container[power]();
 
-        // ==================== RACE CONDITION FIX ====================
-        // Wait up to 15 seconds for container to actually reach "running" state
-        // before trying to run startCode (prevents Docker 409 "container is not running")
+        // ==================== BULLETPROOF RACE CONDITION FIX (60s + REAL SKIP) ====================
+        // Waits up to 60 seconds. Only runs startCode if container is truly running.
+        // If timeout → skip startCode (prevents 409 forever) + only warn log.
         let attempts = 0;
-        const maxAttempts = 30; // 30 × 500ms = 15 seconds
+        const maxAttempts = 120; // 120 × 500ms = 60 seconds
+        let isRunning = false;
         while (attempts < maxAttempts) {
-          const info = await container.inspect();
-          if (info.State.Running) break;
+          try {
+            const info = await container.inspect();
+            if (info && info.State && (info.State.Running === true || info.State.Status === "running")) {
+              isRunning = true;
+              break;
+            }
+          } catch (inspectErr) {
+            // Ignore temporary inspect errors during startup
+          }
           await new Promise(r => setTimeout(r, 500));
           attempts++;
         }
-        if (attempts === maxAttempts) {
-          log.warn(`[KS Wings] Container ${containerId} did not reach running state in time`);
+        if (!isRunning) {
+          log.warn(`[KS Wings] Container ${containerId} did not reach running state in 60s - skipping startCode`);
         }
         // ==================== END OF FIX ====================
 
-        const startCode = req.body.startCode || "";
-        await runStartCode(container, startCode);
-        res.json({ message: `Container ${power}ed + template code executed` });
+        // ONLY run startCode if container is actually running
+        if (isRunning) {
+          const startCode = req.body.startCode || "";
+          await runStartCode(container, startCode);
+        }
+
+        res.json({ message: `Container ${power}ed` + (isRunning ? " + template code executed" : " (startCode skipped)") });
         break;
 
       case "stop":
