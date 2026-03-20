@@ -2,8 +2,8 @@ const express = require("express");
 const router = express.Router();
 const fs = require("fs").promises;
 const path = require("path");
-const { safePath } = require("./utils/SafePath");
-const { calculateDirectorySize } = require("./utils/FileType");
+const { safePath } = require("../utils/SafePath");
+const { calculateDirectorySize } = require("../utils/FileType");
 
 // Copied from UploadFiles.js for disk limit
 async function getDiskLimit(volumeId) {
