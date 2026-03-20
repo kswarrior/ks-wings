@@ -194,4 +194,41 @@ router.post(
   }
 );
 
+// ======================== NEW: ON-THE-FLY ZIP FOR FOLDERS + MASS SELECTED FILES ========================
+router.post("/archive/:id/zip", async (req, res) => {
+  const { id } = req.params;
+  const { files, path: subPath } = req.body;
+  const volumePath = path.join(__dirname, "../volumes", id);
+
+  try {
+    const archive = archiver("zip", { zlib: { level: 9 } });
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", `attachment; filename="${subPath ? subPath.split('/').pop() + '.zip' : 'selected-files.zip'}"`);
+
+    archive.pipe(res);
+
+    if (Array.isArray(files) && files.length > 0) {
+      // Mass selected files/folders
+      for (const f of files) {
+        const full = path.join(volumePath, f);
+        if (fs.existsSync(full)) {
+          if (fs.statSync(full).isDirectory()) {
+            archive.directory(full, f);
+          } else {
+            archive.file(full, { name: f });
+          }
+        }
+      }
+    } else if (subPath) {
+      // Single folder ZIP
+      const target = path.join(volumePath, subPath);
+      archive.directory(target, false);
+    }
+
+    await archive.finalize();
+  } catch (err) {
+    if (!res.headersSent) res.status(500).json({ message: err.message });
+  }
+});
+
 module.exports = router;
