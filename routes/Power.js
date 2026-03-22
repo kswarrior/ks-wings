@@ -40,9 +40,13 @@ const runStartCode = async (container, startCode) => {
       WorkingDir: "/data"
     });
     await exec.start({ Detach: true, Tty: false });
-    log.info(`[KS Wings] Template start code executed successfully in /data`);
+    
+    // ── ADDED: show the actual start code that was run ────────────────
+    log.info(`[KS Wings] Template start code executed successfully in /data → ${startCode}`);
+    
   } catch (err) {
-    log.error(`[KS Wings] Failed to run start code:`, err.message);
+    // ── ADDED: show the actual start code that failed ────────────────
+    log.error(`[KS Wings] Failed to run start code: ${startCode} →`, err.message);
   }
 };
 
