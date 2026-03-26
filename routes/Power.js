@@ -31,21 +31,26 @@ function getStateForContainer(containerId) {
 // ==================== AUTO-RUN TEMPLATE START CODE ====================
 const runStartCode = async (container, startCode) => {
   if (!startCode || typeof startCode !== "string" || startCode.trim() === "") return;
+
   try {
+    // ←←← THIS IS THE KEY CHANGE ←←←
+    // We redirect ALL output of start_code straight into the container's main logs
+    // (so it appears live in the panel console exactly like normal docker output)
+    const execCmd = `/bin/sh -c "${startCode.replace(/"/g, '\\"')}" 2>&1 >> /proc/1/fd/1`;
+
     const exec = await container.exec({
-      Cmd: ["/bin/sh", "-c", startCode],
+      Cmd: ["/bin/sh", "-c", execCmd],
       AttachStdout: false,
       AttachStderr: false,
       Tty: false,
       WorkingDir: "/data"
     });
+
     await exec.start({ Detach: true, Tty: false });
-    
-    // ── ADDED: show the actual start code that was run ────────────────
-    log.info(`[KS Wings] Template start code executed successfully in /data → ${startCode}`);
-    
+
+    log.info(`[KS Wings] Template start code executed (output now visible in panel) → ${startCode}`);
+
   } catch (err) {
-    // ── ADDED: show the actual start code that failed ────────────────
     log.error(`[KS Wings] Failed to run start code: ${startCode} →`, err.message);
   }
 };
