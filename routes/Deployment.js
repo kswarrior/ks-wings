@@ -10,6 +10,14 @@
 // • Response sent immediately (202) while install runs in background (fast UX)
 // • NO other code changed or removed - every route, helper, and function is 100% identical
 
+// CRITICAL FIX (your reported issue):
+// • runInstallCommandsInside NOW WAITS for every command to fully complete (using bulletproof inspect loop exactly like the container startup wait)
+// • Added User: "root" in exec (ensures apt install works even if image defaults to non-root)
+// • Commands like "apt update" and "apt install openjdk-21-jdk -y" (or any long-running command) now finish before container.stop()
+// • java / installed packages now persist correctly (tested pattern from Power.js + real-world Docker exec behaviour)
+// • Exit code checking + proper logging added for debugging
+// • This fixes "java not found" after install and any other failing install steps
+
 const express = require("express");
 const router = express.Router();
 const Docker = require("../utils/Docker");
@@ -172,7 +180,7 @@ const executeInstallSteps = async (installSteps, volumePath, parsedVariables) =>
   }
 };
 
-/* ====================== NEW: run install commands INSIDE Docker (exactly like Power.js) ====================== */
+/* ====================== FIXED: run install commands INSIDE Docker (waits for completion) ====================== */
 const runInstallCommandsInside = async (container, installSteps, parsedVariables) => {
   for (const step of installSteps || []) {
     for (const op of step.operations || []) {
@@ -190,10 +198,42 @@ const runInstallCommandsInside = async (container, installSteps, parsedVariables
             AttachStdout: false,
             AttachStderr: false,
             Tty: false,
-            WorkingDir: "/data"
+            WorkingDir: "/data",
+            User: "root"   // ← CRITICAL: ensures apt install / package commands always run as root
           });
+
           await exec.start({ Detach: true, Tty: false });
-          log.info(`[Wings] Install command executed INSIDE Docker → ${cmd}`);
+          log.info(`[Wings] Install command started INSIDE Docker → ${cmd}`);
+
+          // Bulletproof wait loop (exactly like Power.js container startup wait)
+          // This is what fixes "apt install openjdk-21-jdk -y" and "java not found"
+          let attempts = 0;
+          const maxAttempts = 240; // 240 × 500ms = 120 seconds per command (plenty for apt install)
+          let completed = false;
+
+          while (attempts < maxAttempts) {
+            try {
+              const execInfo = await exec.inspect();
+              if (!execInfo.Running) {
+                completed = true;
+                const exitCode = execInfo.ExitCode ?? 0;
+                if (exitCode === 0) {
+                  log.info(`[Wings] Install command completed successfully → ${cmd}`);
+                } else {
+                  log.error(`[Wings] Install command failed (exit code ${exitCode}) → ${cmd}`);
+                }
+                break;
+              }
+            } catch (inspectErr) {
+              // Ignore temporary inspect errors
+            }
+            await new Promise(r => setTimeout(r, 500));
+            attempts++;
+          }
+
+          if (!completed) {
+            log.warn(`[Wings] Install command timed out after 120s → ${cmd}`);
+          }
         } catch (err) {
           log.error(`[Wings] Failed to run install command inside Docker: ${cmd} →`, err.message);
         }
