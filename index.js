@@ -25,7 +25,10 @@ const docker = new Docker({ socketPath: process.env.dockerSocket });
 const app = express();
 const server = http.createServer(app);
 const log = new CatLoggr();
-const containerLogs = {}; // Global store for logs
+
+// Load split WebSocket handlers from routes/WebSocket/
+const consoleHandler = require("./routes/WebSocket/Console.js");
+const statsHandler = require("./routes/WebSocket/Stats.js");
 
 console.log(chalk.gray(ascii) + chalk.white(`version v${config.version}\n`));
 
@@ -178,251 +181,6 @@ function loadRouters() {
   }
 }
 
-// Utility functions (global)
-function initializeContainerLogs(containerId) {
-  if (!containerLogs[containerId]) {
-    containerLogs[containerId] = [];
-  }
-}
-
-function formatLogMessage(logMessage) {
-  const { content } = logMessage;
-  return content
-    .split('\n')
-    .filter(line => line.length > 0)
-    .map(line => `\r\n\u001b[34m[docker] \x1b[0m${line}\r\n`)
-    .join('');
-}
-
-async function streamDockerLogs(ws, container) {
-  const containerId = container.id;
-  initializeContainerLogs(containerId);
-
-  if (containerLogs[containerId].length > 0) {
-    containerLogs[containerId].forEach((logMessage) => {
-      ws.send(formatLogMessage(logMessage));
-    });
-  }
-
-  try {
-    const logStream = await container.logs({
-      follow: true,
-      stdout: true,
-      stderr: true,
-      tail: 0,
-    });
-
-    if (!logStream) {
-      throw new Error("Log stream is undefined");
-    }
-
-    logStream.on("data", (chunk) => {
-      // === ONLY CHANGE: Strip Docker's 8-byte binary header (stdout/stderr frame) ===
-      // This is the exact reason server logs were invisible/garbage before
-      let content = chunk.length > 8 
-        ? chunk.slice(8).toString('utf8') 
-        : chunk.toString('utf8');
-
-      const logMessage = {
-        timestamp: new Date().toISOString(),
-        content: content,
-      };
-      containerLogs[containerId].push(logMessage);
-      const formattedMessage = formatLogMessage(logMessage);
-      if (ws.readyState === ws.OPEN && ws.bufferedAmount === 0) {
-        ws.send(formattedMessage);
-      }
-    });
-
-    logStream.on("error", (err) => {
-      log.error(`Docker log stream error: ${err.message}`);
-      if (ws.readyState === ws.OPEN) {
-        ws.send(`\r\n\u001b[31m[kswings] \x1b[0mLog stream error: ${err.message}\r\n`);
-      }
-    });
-
-    ws.on('close', () => {
-      try {
-        logStream.destroy();
-      } catch (_) {}
-      log.info("WebSocket client disconnected");
-    });
-  } catch (err) {
-    log.error(`Failed to attach Docker logs: ${err.message}`);
-    if (ws.readyState === ws.OPEN) {
-      ws.send(`\r\n\u001b[31m[kswings] \x1b[0mFailed to attach logs: ${err.message}\r\n`);
-    }
-  }
-}
-
-async function getVolumeSize(volumeId) {
-  const volumePath = path.join("./volumes", volumeId);
-  try {
-    if (!fs.existsSync(volumePath)) return "0";
-    const totalSize = await calculateDirectorySizeAsync(volumePath);
-    return (totalSize / (1024 * 1024)).toFixed(2);
-  } catch (err) {
-    log.warn(`Failed to calculate volume size for ${volumeId}: ${err.message}`);
-    return "0";
-  }
-}
-
-async function calculateDirectorySizeAsync(dirPath, currentDepth = 0) {
-  if (currentDepth >= 500) {
-    log.warn(`Maximum depth reached at ${dirPath}`);
-    return 0;
-  }
-
-  return new Promise((resolve, reject) => {
-    fs.readdir(dirPath, { withFileTypes: true }, (err, files) => {
-      if (err) {
-        reject(err);
-        return;
-      }
-      let totalSize = 0;
-      let processed = 0;
-      const totalFiles = files.length;
-      if (totalFiles === 0) {
-        resolve(0);
-        return;
-      }
-      files.forEach((file) => {
-        const filePath = path.join(dirPath, file.name);
-        fs.stat(filePath, (statErr, stats) => {
-          if (statErr) {
-            processed++;
-            if (processed === totalFiles) resolve(totalSize);
-            return;
-          }
-          if (stats.isDirectory()) {
-            calculateDirectorySizeAsync(filePath, currentDepth + 1).then((size) => {
-              totalSize += size;
-              processed++;
-              if (processed === totalFiles) resolve(totalSize);
-            }).catch(reject);
-          } else {
-            totalSize += stats.size;
-            processed++;
-            if (processed === totalFiles) resolve(totalSize);
-          }
-        });
-      });
-    });
-  });
-}
-
-function formatBytes(bytes) {
-  if (bytes === 0) return "0 Bytes";
-  const k = 1024;
-  const sizes = ["Bytes", "KB", "MB", "GB", "TB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
-}
-
-async function executeCommand(ws, container, command) {
-  try {
-    const exec = await container.exec({
-      Cmd: ['sh', '-c', command],
-      AttachStdin: true,
-      AttachStdout: true,
-      AttachStderr: true,
-      Tty: true
-    });
-    const stream = await exec.start();
-    stream.on("data", (chunk) => {
-      if (ws.readyState === ws.OPEN) {
-        ws.send(chunk.toString('utf8'));
-      }
-    });
-    stream.on("end", () => {
-      if (ws.readyState === ws.OPEN) {
-        ws.send('\nCommand execution completed');
-      }
-    });
-    stream.on("error", (err) => {
-      log.error("Exec stream error:", err);
-      if (ws.readyState === ws.OPEN) {
-        ws.send(`Error in exec stream: ${err.message}`);
-      }
-    });
-  } catch (err) {
-    log.error("Failed to execute command:", err);
-    if (ws.readyState === ws.OPEN) {
-      ws.send(`Failed to execute command: ${err.message}`);
-    }
-  }
-}
-
-async function performPowerAction(ws, container, action) {
-  const actionMap = {
-    start: container.start.bind(container),
-    stop: container.stop.bind(container),
-    restart: container.restart.bind(container),
-  };
-
-  if (!actionMap[action]) {
-    if (ws.readyState === ws.OPEN) {
-      ws.send(`\r\n\u001b[33m[kswings] \x1b[0mInvalid action: ${action}\r\n`);
-    }
-    return;
-  }
-
-  const containerId = container.id;
-
-  if (action === "start" || action === "restart") {
-    try {
-      const containerInfo = await container.inspect();
-      const dataMount = containerInfo.Mounts.find(
-        (m) => m.Type === "bind" && m.Destination === "/app/data"
-      );
-
-      if (dataMount) {
-        const volumePath = dataMount.Source;
-        const volumeId = path.basename(volumePath);
-        const statesFilePath = path.join(__dirname, "storage/states.json");
-
-        if (fs.existsSync(statesFilePath)) {
-          const statesData = JSON.parse(fs.readFileSync(statesFilePath, "utf8"));
-          if (statesData[volumeId] && statesData[volumeId].diskLimit > 0) {
-            const volumeSize = await getVolumeSize(volumeId);
-            const volumeSizeMiB = parseFloat(volumeSize) || 0;
-            if (volumeSizeMiB >= statesData[volumeId].diskLimit) {
-              if (ws.readyState === ws.OPEN) {
-                ws.send(
-                  `\r\n\u001b[31m[kswings] \x1b[0mCannot ${action}: storage limit exceeded (${volumeSizeMiB.toFixed(2)} MiB / ${statesData[volumeId].diskLimit} MiB). Delete files or increase limit.\r\n`
-                );
-              }
-              return;
-            }
-          }
-        }
-      }
-    } catch (checkErr) {
-      log.warn("Failed to check storage limit for power action:", checkErr.message);
-    }
-  }
-
-  const message = `\r\n\u001b[33m[kswings] \x1b[0mWorking on ${action}...\r\n`;
-  if (ws.readyState === ws.OPEN) ws.send(message);
-
-  try {
-    if (action === "restart" || action === "stop") {
-      containerLogs[containerId] = [];
-    }
-
-    streamDockerLogs(ws, container);
-
-    await actionMap[action]();
-
-    const successMessage = `\r\n\u001b[32m[kswings] \x1b[0m${action.charAt(0).toUpperCase() + action.slice(1)} action completed.\r\n`;
-    if (ws.readyState === ws.OPEN) ws.send(successMessage);
-  } catch (err) {
-    log.error(`Error performing ${action} action:`, err.message);
-    const errorMessage = `\r\n\u001b[31m[kswings] \x1b[0mAction failed: ${err.message}\r\n`;
-    if (ws.readyState === ws.OPEN) ws.send(errorMessage);
-  }
-}
-
 function initializeWebSocketServer(server) {
   const wss = new WebSocket.Server({ server });
 
@@ -467,17 +225,17 @@ function initializeWebSocketServer(server) {
 
         switch (msg.event) {
           case "cmd":
-            if (msg.args && msg.args[0]) executeCommand(ws, container, msg.args[0]);
-            else if (msg.command) executeCommand(ws, container, msg.command); // Fallback for old format
+            if (msg.args && msg.args[0]) consoleHandler.executeCommand(ws, container, msg.args[0]);
+            else if (msg.command) consoleHandler.executeCommand(ws, container, msg.command); // Fallback for old format
             break;
           case "power:start":
-            performPowerAction(ws, container, "start");
+            consoleHandler.performPowerAction(ws, container, "start");
             break;
           case "power:stop":
-            performPowerAction(ws, container, "stop");
+            consoleHandler.performPowerAction(ws, container, "stop");
             break;
           case "power:restart":
-            performPowerAction(ws, container, "restart");
+            consoleHandler.performPowerAction(ws, container, "restart");
             break;
           default:
             if (ws.readyState === ws.OPEN) ws.send("Unsupported event");
@@ -520,78 +278,12 @@ function initializeWebSocketServer(server) {
         }
 
         if (req.url.startsWith("/exec/")) {
-          setupExecSession(ws, container);
+          consoleHandler.setupExecSession(ws, container);
         } else if (req.url.startsWith("/stats/")) {
-          setupStatsStreaming(ws, container, volumeId);
+          statsHandler.setupStatsStreaming(ws, container, volumeId);
         } else {
           ws.close(1002, "URL must start with /exec/ or /stats/");
         }
-      });
-    }
-
-    async function setupExecSession(ws, container) {
-      streamDockerLogs(ws, container);
-    }
-
-    async function setupStatsStreaming(ws, container, volumeId) {
-      const statesFilePath = path.join(__dirname, "storage/states.json");
-      let diskLimit = 0;
-      try {
-        if (fs.existsSync(statesFilePath)) {
-          const statesData = JSON.parse(fs.readFileSync(statesFilePath, "utf8"));
-          if (statesData[volumeId] && statesData[volumeId].diskLimit) {
-            diskLimit = statesData[volumeId].diskLimit;
-          }
-        }
-      } catch (err) {
-        log.warn("Failed to read disk limit from states:", err.message);
-      }
-
-      let hasAutoStopped = false;
-
-      const fetchStats = async () => {
-        try {
-          const stats = await new Promise((resolve, reject) => {
-            container.stats({ stream: false }, (err, data) => {
-              if (err) reject(err);
-              else resolve(data);
-            });
-          });
-
-          const volumeSize = await getVolumeSize(volumeId.toString());
-          stats.volumeSize = volumeSize;
-          stats.diskLimit = diskLimit;
-          const volumeSizeMiB = parseFloat(volumeSize) || 0;
-          const storageExceeded = diskLimit > 0 && volumeSizeMiB >= diskLimit;
-          stats.storageExceeded = storageExceeded;
-
-          if (storageExceeded && !hasAutoStopped) {
-            const containerInfo = await container.inspect();
-            if (containerInfo.State.Running) {
-              log.warn(`Storage exceeded for container ${container.id} - auto-stopping`);
-              await container.stop();
-              hasAutoStopped = true;
-            }
-          }
-
-          if (ws.readyState === ws.OPEN) {
-            ws.send(JSON.stringify({
-              event: 'stats',
-              args: [stats]
-            }));
-          }
-        } catch (err) {
-          log.error(`Failed to fetch stats for container ${container.id}:`, err.message);
-          if (ws.readyState === ws.OPEN) {
-            ws.send(JSON.stringify({ error: 'Failed to fetch stats' }));
-          }
-        }
-      };
-
-      const statsInterval = setInterval(fetchStats, 1000);
-
-      ws.on('close', () => {
-        clearInterval(statsInterval);
       });
     }
   });
