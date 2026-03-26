@@ -109,10 +109,8 @@ async function setupStatsStreaming(ws, container, volumeId) {
       }
 
       if (ws.readyState === ws.OPEN) {
-        ws.send(JSON.stringify({
-          event: 'stats',
-          args: [stats]
-        }));
+        // ✅ FIXED: Send RAW stats object (exactly what panel EJS expects)
+        ws.send(JSON.stringify(stats));
       }
     } catch (err) {
       log.error(`Failed to fetch stats for container ${container.id}:`, err.message);
