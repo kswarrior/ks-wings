@@ -109,13 +109,20 @@ async function setupStatsStreaming(ws, container, volumeId) {
       }
 
       if (ws.readyState === ws.OPEN) {
-        // ✅ FIXED: Send RAW stats object (exactly what panel EJS expects)
-        ws.send(JSON.stringify(stats));
+        // ✅ FIXED: Send Pterodactyl/ks-panel format that the frontend expects
+        // The panel proxy + instance.ejs Chart.js looks for { event: "stats", args: [data] }
+        ws.send(JSON.stringify({
+          event: "stats",
+          args: [stats]
+        }));
       }
     } catch (err) {
       log.error(`Failed to fetch stats for container ${container.id}:`, err.message);
       if (ws.readyState === ws.OPEN) {
-        ws.send(JSON.stringify({ error: 'Failed to fetch stats' }));
+        ws.send(JSON.stringify({
+          event: "stats",
+          args: [{ error: "Failed to fetch stats" }]
+        }));
       }
     }
   };
