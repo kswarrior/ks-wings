@@ -85,16 +85,27 @@ async function setupStatsStreaming(ws, container, volumeId) {
 
   const fetchStats = async () => {
     try {
+      // ✅ FIXED: Correct way to fetch stats with your custom Docker wrapper
+      const statsRes = await container.stats({ stream: false });
+
       const stats = await new Promise((resolve, reject) => {
-        container.stats({ stream: false }, (err, data) => {
-          if (err) reject(err);
-          else resolve(data);
+        let data = "";
+        statsRes.on("data", (chunk) => { data += chunk; });
+        statsRes.on("end", () => {
+          try {
+            resolve(JSON.parse(data));
+          } catch (e) {
+            reject(e);
+          }
         });
+        statsRes.on("error", reject);
       });
 
+      // Add our custom fields (exactly what the panel frontend expects)
       const volumeSize = await getVolumeSize(volumeId.toString());
       stats.volumeSize = volumeSize;
       stats.diskLimit = diskLimit;
+
       const volumeSizeMiB = parseFloat(volumeSize) || 0;
       const storageExceeded = diskLimit > 0 && volumeSizeMiB >= diskLimit;
       stats.storageExceeded = storageExceeded;
@@ -109,20 +120,13 @@ async function setupStatsStreaming(ws, container, volumeId) {
       }
 
       if (ws.readyState === ws.OPEN) {
-        // ✅ FIXED: Send Pterodactyl/ks-panel format that the frontend expects
-        // The panel proxy + instance.ejs Chart.js looks for { event: "stats", args: [data] }
-        ws.send(JSON.stringify({
-          event: "stats",
-          args: [stats]
-        }));
+        // ✅ Send RAW stats object (this is what instance.ejs expects)
+        ws.send(JSON.stringify(stats));
       }
     } catch (err) {
       log.error(`Failed to fetch stats for container ${container.id}:`, err.message);
       if (ws.readyState === ws.OPEN) {
-        ws.send(JSON.stringify({
-          event: "stats",
-          args: [{ error: "Failed to fetch stats" }]
-        }));
+        ws.send(JSON.stringify({ error: "Failed to fetch stats" }));
       }
     }
   };
