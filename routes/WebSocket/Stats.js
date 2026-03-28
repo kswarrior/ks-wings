@@ -1,64 +1,59 @@
 const fs = require("node:fs");
 const path = require("path");
+const { execFile } = require("node:child_process");
 const CatLoggr = require("cat-loggr");
 const log = new CatLoggr();
 
-async function getVolumeSize(volumeId) {
-  const volumePath = path.join("./volumes", volumeId);
-  try {
-    if (!fs.existsSync(volumePath)) return "0";
-    const totalSize = await calculateDirectorySizeAsync(volumePath);
-    return (totalSize / (1024 * 1024)).toFixed(2);
-  } catch (err) {
-    log.warn(`Failed to calculate volume size for ${volumeId}: ${err.message}`);
-    return "0";
-  }
+// ──────────────────────────────────────────────────────────────
+// Global cache + background updater (this is the magic)
+const volumeSizeCache = new Map();     // volumeId → sizeInMB (string)
+const activeVolumes = new Set();       // volumes currently being monitored
+const CACHE_TTL_MS = 30000;            // refresh every 30 seconds
+
+let backgroundInterval = null;
+
+function startBackgroundUpdater() {
+  if (backgroundInterval) return;
+  backgroundInterval = setInterval(() => {
+    activeVolumes.forEach((volumeId) => updateVolumeSizeInBackground(volumeId));
+  }, CACHE_TTL_MS);
 }
 
-async function calculateDirectorySizeAsync(dirPath, currentDepth = 0) {
-  if (currentDepth >= 500) {
-    log.warn(`Maximum depth reached at ${dirPath}`);
-    return 0;
+async function updateVolumeSizeInBackground(volumeId) {
+  const volumePath = path.join("./volumes", volumeId);
+  if (!fs.existsSync(volumePath)) {
+    volumeSizeCache.set(volumeId, "0");
+    return;
   }
 
-  return new Promise((resolve, reject) => {
-    fs.readdir(dirPath, { withFileTypes: true }, (err, files) => {
-      if (err) {
-        reject(err);
-        return;
-      }
-      let totalSize = 0;
-      let processed = 0;
-      const totalFiles = files.length;
-      if (totalFiles === 0) {
-        resolve(0);
-        return;
-      }
-      files.forEach((file) => {
-        const filePath = path.join(dirPath, file.name);
-        fs.stat(filePath, (statErr, stats) => {
-          if (statErr) {
-            processed++;
-            if (processed === totalFiles) resolve(totalSize);
-            return;
-          }
-          if (stats.isDirectory()) {
-            calculateDirectorySizeAsync(filePath, currentDepth + 1).then((size) => {
-              totalSize += size;
-              processed++;
-              if (processed === totalFiles) resolve(totalSize);
-            }).catch(reject);
-          } else {
-            totalSize += stats.size;
-            processed++;
-            if (processed === totalFiles) resolve(totalSize);
-          }
-        });
-      });
-    });
+  execFile("du", ["-s", "--block-size=1M", volumePath], (err, stdout) => {
+    if (err) {
+      log.warn(`Background du failed for ${volumeId}: ${err.message}`);
+      volumeSizeCache.set(volumeId, "0");
+      return;
+    }
+    const sizeMB = stdout.trim().split("\t")[0] || "0";
+    volumeSizeCache.set(volumeId, sizeMB);
   });
 }
 
+// Fast getVolumeSize – never blocks the stats loop
+async function getVolumeSize(volumeId) {
+  const idStr = volumeId.toString();
+  const cached = volumeSizeCache.get(idStr);
+
+  if (cached !== undefined) return cached;
+
+  // First time we see this volume → start background calc, return 0 instantly
+  activeVolumes.add(idStr);
+  startBackgroundUpdater();
+  updateVolumeSizeInBackground(idStr);   // fire-and-forget
+  volumeSizeCache.set(idStr, "0");       // temporary value
+  return "0";
+}
+
+// ──────────────────────────────────────────────────────────────
+// Keep the rest of your file exactly the same
 function formatBytes(bytes) {
   if (bytes === 0) return "0 Bytes";
   const k = 1024;
@@ -85,24 +80,20 @@ async function setupStatsStreaming(ws, container, volumeId) {
 
   const fetchStats = async () => {
     try {
-      // ✅ FIXED: Correct way to fetch stats with your custom Docker wrapper
       const statsRes = await container.stats({ stream: false });
 
       const stats = await new Promise((resolve, reject) => {
         let data = "";
         statsRes.on("data", (chunk) => { data += chunk; });
         statsRes.on("end", () => {
-          try {
-            resolve(JSON.parse(data));
-          } catch (e) {
-            reject(e);
-          }
+          try { resolve(JSON.parse(data)); } catch (e) { reject(e); }
         });
         statsRes.on("error", reject);
       });
 
-      // Add our custom fields (exactly what the panel frontend expects)
+      // ← This is now INSTANT (no await delay)
       const volumeSize = await getVolumeSize(volumeId.toString());
+
       stats.volumeSize = volumeSize;
       stats.diskLimit = diskLimit;
 
@@ -120,7 +111,6 @@ async function setupStatsStreaming(ws, container, volumeId) {
       }
 
       if (ws.readyState === ws.OPEN) {
-        // ✅ Send RAW stats object (this is what instance.ejs expects)
         ws.send(JSON.stringify(stats));
       }
     } catch (err) {
@@ -135,12 +125,13 @@ async function setupStatsStreaming(ws, container, volumeId) {
 
   ws.on('close', () => {
     clearInterval(statsInterval);
+    // Optional: clean up activeVolumes if you want (not required)
   });
 }
 
 module.exports = {
   getVolumeSize,
-  calculateDirectorySizeAsync,
   formatBytes,
   setupStatsStreaming
+  // you can delete calculateDirectorySizeAsync – it's no longer used
 };
