@@ -10,10 +10,7 @@ const statsHandler = require("./Stats.js");
 async function streamDockerLogs(ws, container) {
   const containerId = container.id;
 
-  // === FIX 1: Prevent duplicate streams (this was causing logs to show double) ===
-  // If a stream is already active for this WebSocket, do nothing.
-  // This makes the function idempotent and stops history from being re-sent
-  // every time performPowerAction or setupExecSession is called.
+  // Prevent duplicate streams (this was causing logs to show double)
   if (ws.logStream) {
     log.info(`[kswings] Log stream already active for this WebSocket – skipping duplicate setup`);
     return;
@@ -38,12 +35,12 @@ async function streamDockerLogs(ws, container) {
         ? chunk.slice(8).toString("utf8")
         : chunk.toString("utf8");
 
-      // === FIX 2: Remove the unwanted "[0 INFO]" / "0 INFO]" prefix from every line ===
-      // This cleans the raw container output exactly as you requested.
-      // Works even if the prefix has ANSI colors around it.
-      const cleanContent = content.replace(/\[?0 INFO\]?\s*/g, "");
+      // === FIXED: Remove ALL "X INFO]:" prefixes (0 INFO], 6 INFO], 7 INFO], etc.) ===
+      // This matches any number followed by " INFO]:" (with or without colon/spaces)
+      // Exactly what PaperMC is outputting in your container.
+      const cleanContent = content.replace(/\d+\s+INFO\]:?\s*/g, "");
 
-      // RAW output - exactly what is inside the container (now cleaned)
+      // RAW output - now completely clean (exactly what you wanted)
       if (ws.readyState === ws.OPEN && ws.bufferedAmount === 0) {
         ws.send(cleanContent);
       }
@@ -56,7 +53,7 @@ async function streamDockerLogs(ws, container) {
       }
     });
 
-    // Clean close handler (now safely handles the stored stream reference)
+    // Clean close handler
     ws.on("close", () => {
       try {
         if (ws.logStream) {
@@ -177,7 +174,7 @@ async function performPowerAction(ws, container, action) {
 
   try {
     // Start streaming logs BEFORE the power action → stop/restart logs are captured
-    // (Now safe – will do nothing if stream already exists, preventing double logs)
+    // (Still safe – no duplicate streams)
     streamDockerLogs(ws, container);
 
     await actionMap[action]();
@@ -198,7 +195,7 @@ function setupExecSession(ws, container) {
   streamDockerLogs(ws, container);
 }
 
-// Legacy functions kept for compatibility (they are no longer used internally)
+// Legacy functions kept for compatibility
 function initializeContainerLogs() {} // no-op
 function formatLogMessage(content) {
   return content; // raw passthrough
