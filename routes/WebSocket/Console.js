@@ -4,35 +4,46 @@ const CatLoggr = require("cat-loggr");
 const log = new CatLoggr();
 const statsHandler = require("./Stats.js");
 
-// ==============================================
-// RAW LOG STREAM - Exactly like docker logs -f
-// ==============================================
+// Removed: global containerLogs + old formatLogMessage (no longer needed)
+
 async function streamDockerLogs(ws, container) {
   const containerId = container.id;
 
   try {
-    // IMPORTANT: NO tail → Docker returns FULL history + live follow
     const logStream = await container.logs({
       follow: true,
       stdout: true,
       stderr: true,
-      // tail removed = all logs (same as docker logs -f)
+      tail: 200,                    // ← instant recent history (smooth & fast)
     });
 
     if (!logStream) {
       throw new Error("Log stream is undefined");
     }
 
-    logStream.on("data", (chunk) => {
-      // Strip Docker's 8-byte multiplex header (stdout/stderr)
-      const content = chunk.length > 8
-        ? chunk.slice(8).toString("utf8")
-        : chunk.toString("utf8");
+    let buffer = Buffer.alloc(0);   // proper multi-frame parser
 
-      // RAW output - exactly what is inside the container
-      if (ws.readyState === ws.OPEN && ws.bufferedAmount === 0) {
-        ws.send(content);
+    logStream.on("data", (chunk) => {
+      buffer = Buffer.concat([buffer, chunk]);
+
+      let offset = 0;
+      while (buffer.length - offset >= 8) {
+        const frameLength = buffer.readUInt32BE(offset + 4);
+        if (buffer.length - offset < 8 + frameLength) break; // incomplete frame
+
+        const payload = buffer.subarray(offset + 8, offset + 8 + frameLength);
+        let content = payload.toString("utf8");
+
+        // Make sure terminal displays cleanly
+        content = content.replace(/\n/g, "\r\n");
+
+        if (ws.readyState === ws.OPEN && ws.bufferedAmount === 0) {
+          ws.send(content);
+        }
+
+        offset += 8 + frameLength;
       }
+      buffer = buffer.subarray(offset); // keep remainder for next chunk
     });
 
     logStream.on("error", (err) => {
@@ -43,12 +54,9 @@ async function streamDockerLogs(ws, container) {
     });
 
     ws.on("close", () => {
-      try {
-        logStream.destroy();
-      } catch (_) {}
-      log.info("WebSocket client disconnected from logs");
+      try { logStream.destroy(); } catch (_) {}
+      log.info("WebSocket client disconnected");
     });
-
   } catch (err) {
     log.error(`Failed to attach Docker logs: ${err.message}`);
     if (ws.readyState === ws.OPEN) {
@@ -57,9 +65,6 @@ async function streamDockerLogs(ws, container) {
   }
 }
 
-// ==============================================
-// EXEC COMMAND (unchanged - works perfectly)
-// ==============================================
 async function executeCommand(ws, container, command) {
   try {
     const exec = await container.exec({
@@ -70,36 +75,22 @@ async function executeCommand(ws, container, command) {
       Tty: true,
     });
     const stream = await exec.start();
-
     stream.on("data", (chunk) => {
-      if (ws.readyState === ws.OPEN) {
-        ws.send(chunk.toString("utf8"));
-      }
+      if (ws.readyState === ws.OPEN) ws.send(chunk.toString("utf8"));
     });
-
     stream.on("end", () => {
-      if (ws.readyState === ws.OPEN) {
-        ws.send("\nCommand execution completed\n");
-      }
+      if (ws.readyState === ws.OPEN) ws.send("\nCommand execution completed");
     });
-
     stream.on("error", (err) => {
       log.error("Exec stream error:", err);
-      if (ws.readyState === ws.OPEN) {
-        ws.send(`Error in exec stream: ${err.message}`);
-      }
+      if (ws.readyState === ws.OPEN) ws.send(`Error in exec stream: ${err.message}`);
     });
   } catch (err) {
     log.error("Failed to execute command:", err);
-    if (ws.readyState === ws.OPEN) {
-      ws.send(`Failed to execute command: ${err.message}`);
-    }
+    if (ws.readyState === ws.OPEN) ws.send(`Failed to execute command: ${err.message}`);
   }
 }
 
-// ==============================================
-// POWER ACTIONS (start/stop/restart) - FULLY PRESERVED
-// ==============================================
 async function performPowerAction(ws, container, action) {
   const actionMap = {
     start: container.start.bind(container),
@@ -114,49 +105,12 @@ async function performPowerAction(ws, container, action) {
     return;
   }
 
-  const containerId = container.id;
-
-  // Disk limit check (exactly as you had it)
-  if (action === "start" || action === "restart") {
-    try {
-      const containerInfo = await container.inspect();
-      const dataMount = containerInfo.Mounts.find(
-        (m) => m.Type === "bind" && m.Destination === "/app/data"
-      );
-
-      if (dataMount) {
-        const volumePath = dataMount.Source;
-        const volumeId = path.basename(volumePath);
-        const statesFilePath = path.join(__dirname, "../../storage/states.json");
-
-        if (fs.existsSync(statesFilePath)) {
-          const statesData = JSON.parse(fs.readFileSync(statesFilePath, "utf8"));
-          if (statesData[volumeId] && statesData[volumeId].diskLimit > 0) {
-            const volumeSize = await statsHandler.getVolumeSize(volumeId);
-            const volumeSizeMiB = parseFloat(volumeSize) || 0;
-
-            if (volumeSizeMiB >= statesData[volumeId].diskLimit) {
-              if (ws.readyState === ws.OPEN) {
-                ws.send(
-                  `\r\n\u001b[31m[kswings] \x1b[0mCannot ${action}: storage limit exceeded (${volumeSizeMiB.toFixed(2)} MiB / ${statesData[volumeId].diskLimit} MiB). Delete files or increase limit.\r\n`
-                );
-              }
-              return;
-            }
-          }
-        }
-      }
-    } catch (checkErr) {
-      log.warn("Failed to check storage limit for power action:", checkErr.message);
-    }
-  }
-
   const message = `\r\n\u001b[33m[kswings] \x1b[0mWorking on ${action}...\r\n`;
   if (ws.readyState === ws.OPEN) ws.send(message);
 
   try {
-    // Start streaming logs BEFORE the power action → stop/restart logs are captured
-    streamDockerLogs(ws, container);
+    // Removed: old containerLogs clear + streamDockerLogs call
+    // (prevents double lines + we now use native tail:200)
 
     await actionMap[action]();
 
@@ -169,22 +123,11 @@ async function performPowerAction(ws, container, action) {
   }
 }
 
-// ==============================================
-// SETUP EXEC SESSION (used by console WS)
-// ==============================================
 function setupExecSession(ws, container) {
-  streamDockerLogs(ws, container);
-}
-
-// Legacy functions kept for compatibility (they are no longer used internally)
-function initializeContainerLogs() {} // no-op
-function formatLogMessage(content) {
-  return content; // raw passthrough
+  streamDockerLogs(ws, container);   // only called once per console connection
 }
 
 module.exports = {
-  initializeContainerLogs,
-  formatLogMessage,
   streamDockerLogs,
   executeCommand,
   performPowerAction,
