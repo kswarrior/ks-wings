@@ -5,52 +5,48 @@ const log = new CatLoggr();
 const statsHandler = require("./Stats.js");
 
 // ==============================================
-// PROPER DOCKER LOG STREAM (fixed & optimized)
+// RAW LOG STREAM - Exactly like docker logs -f
 // ==============================================
 async function streamDockerLogs(ws, container) {
   const containerId = container.id;
 
+  // === FIX 1: Prevent duplicate streams (this was causing logs to show double) ===
+  // If a stream is already active for this WebSocket, do nothing.
+  // This makes the function idempotent and stops history from being re-sent
+  // every time performPowerAction or setupExecSession is called.
+  if (ws.logStream) {
+    log.info(`[kswings] Log stream already active for this WebSocket – skipping duplicate setup`);
+    return;
+  }
+
   try {
-    // tail: 200 + follow = INSTANT connection + smooth live view
-    // (exactly like "docker logs -f --tail 200")
+    // IMPORTANT: NO tail → Docker returns FULL history + live follow
     const logStream = await container.logs({
       follow: true,
       stdout: true,
       stderr: true,
-      tail: 200,                    // ← critical for instant & smooth
+      // tail removed = all logs (same as docker logs -f)
     });
 
     if (!logStream) {
       throw new Error("Log stream is undefined");
     }
 
-    let buffer = Buffer.alloc(0);   // ← fixes "0 INFO] 1 InFO]" garbage
-
     logStream.on("data", (chunk) => {
-      buffer = Buffer.concat([buffer, chunk]);
+      // Strip Docker's 8-byte multiplex header (stdout/stderr)
+      const content = chunk.length > 8
+        ? chunk.slice(8).toString("utf8")
+        : chunk.toString("utf8");
 
-      let offset = 0;
-      while (buffer.length - offset >= 8) {
-        const frameLength = buffer.readUInt32BE(offset + 4);
+      // === FIX 2: Remove the unwanted "[0 INFO]" / "0 INFO]" prefix from every line ===
+      // This cleans the raw container output exactly as you requested.
+      // Works even if the prefix has ANSI colors around it.
+      const cleanContent = content.replace(/\[?0 INFO\]?\s*/g, "");
 
-        // Not enough data for complete frame yet → wait for next chunk
-        if (buffer.length - offset < 8 + frameLength) break;
-
-        const payload = buffer.subarray(offset + 8, offset + 8 + frameLength);
-        let content = payload.toString("utf8");
-
-        // Make terminal lines clean and smooth
-        content = content.replace(/\n/g, "\r\n");
-
-        if (ws.readyState === ws.OPEN && ws.bufferedAmount === 0) {
-          ws.send(content);
-        }
-
-        offset += 8 + frameLength;
+      // RAW output - exactly what is inside the container (now cleaned)
+      if (ws.readyState === ws.OPEN && ws.bufferedAmount === 0) {
+        ws.send(cleanContent);
       }
-
-      // Keep any remaining partial frame for next chunk
-      buffer = buffer.subarray(offset);
     });
 
     logStream.on("error", (err) => {
@@ -60,15 +56,22 @@ async function streamDockerLogs(ws, container) {
       }
     });
 
+    // Clean close handler (now safely handles the stored stream reference)
     ws.on("close", () => {
       try {
-        logStream.destroy();
+        if (ws.logStream) {
+          ws.logStream.destroy();
+          delete ws.logStream;
+        }
       } catch (_) {}
-      log.info(`WebSocket client disconnected from container ${containerId}`);
+      log.info("WebSocket client disconnected from logs");
     });
 
+    // Store the stream so we can detect duplicates and clean up on close
+    ws.logStream = logStream;
+
   } catch (err) {
-    log.error(`Failed to attach Docker logs for ${containerId}: ${err.message}`);
+    log.error(`Failed to attach Docker logs: ${err.message}`);
     if (ws.readyState === ws.OPEN) {
       ws.send(`\r\n\u001b[31m[kswings] \x1b[0mFailed to attach logs: ${err.message}\r\n`);
     }
@@ -116,7 +119,7 @@ async function executeCommand(ws, container, command) {
 }
 
 // ==============================================
-// POWER ACTIONS (start/stop/restart) - FULLY FIXED
+// POWER ACTIONS (start/stop/restart) - FULLY PRESERVED
 // ==============================================
 async function performPowerAction(ws, container, action) {
   const actionMap = {
@@ -134,7 +137,7 @@ async function performPowerAction(ws, container, action) {
 
   const containerId = container.id;
 
-  // Disk limit check (exactly as you had it - preserved)
+  // Disk limit check (exactly as you had it)
   if (action === "start" || action === "restart") {
     try {
       const containerInfo = await container.inspect();
@@ -156,7 +159,7 @@ async function performPowerAction(ws, container, action) {
             if (volumeSizeMiB >= statesData[volumeId].diskLimit) {
               if (ws.readyState === ws.OPEN) {
                 ws.send(
-                  `\r\n\u001b[31m[kswings] \x1b[0mCannot \( {action}: storage limit exceeded ( \){volumeSizeMiB.toFixed(2)} MiB / ${statesData[volumeId].diskLimit} MiB). Delete files or increase limit.\r\n`
+                  `\r\n\u001b[31m[kswings] \x1b[0mCannot ${action}: storage limit exceeded (${volumeSizeMiB.toFixed(2)} MiB / ${statesData[volumeId].diskLimit} MiB). Delete files or increase limit.\r\n`
                 );
               }
               return;
@@ -173,30 +176,32 @@ async function performPowerAction(ws, container, action) {
   if (ws.readyState === ws.OPEN) ws.send(message);
 
   try {
-    // CRITICAL FIX: Do NOT call streamDockerLogs here
-    // (this was causing doubled lines every time you clicked start/restart/stop)
+    // Start streaming logs BEFORE the power action → stop/restart logs are captured
+    // (Now safe – will do nothing if stream already exists, preventing double logs)
+    streamDockerLogs(ws, container);
+
     await actionMap[action]();
 
     const successMessage = `\r\n\u001b[32m[kswings] \x1b[0m${action.charAt(0).toUpperCase() + action.slice(1)} action completed.\r\n`;
     if (ws.readyState === ws.OPEN) ws.send(successMessage);
   } catch (err) {
-    log.error(`Error performing ${action} action on ${containerId}:`, err.message);
+    log.error(`Error performing ${action} action:`, err.message);
     const errorMessage = `\r\n\u001b[31m[kswings] \x1b[0mAction failed: ${err.message}\r\n`;
     if (ws.readyState === ws.OPEN) ws.send(errorMessage);
   }
 }
 
 // ==============================================
-// SETUP EXEC SESSION (called once per console connect)
+// SETUP EXEC SESSION (used by console WS)
 // ==============================================
 function setupExecSession(ws, container) {
-  streamDockerLogs(ws, container);   // ← only called here (once)
+  streamDockerLogs(ws, container);
 }
 
-// Legacy functions kept for compatibility (no-op)
-function initializeContainerLogs() {} 
+// Legacy functions kept for compatibility (they are no longer used internally)
+function initializeContainerLogs() {} // no-op
 function formatLogMessage(content) {
-  return content;
+  return content; // raw passthrough
 }
 
 module.exports = {
