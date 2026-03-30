@@ -18,7 +18,7 @@ if (!options.panel || !options.key) {
   process.exit(1);
 }
 
-// Function to make HTTP/HTTPS request
+// Function to make HTTP/HTTPS request to the panel
 function makeHttpRequest(url, method = "POST") {
   return new Promise((resolve, reject) => {
     const isHttps = url.startsWith("https://");
@@ -56,29 +56,31 @@ function makeHttpRequest(url, method = "POST") {
 async function configureNode() {
   const configPath = path.join(__dirname, "../config.json");
 
-  console.log("🔄 Connecting to panel to fetch full configuration...");
+  console.log("🔄 Connecting to KS Panel to fetch full configuration...");
 
-  // Build the configure URL - only configureKey is needed now
+  // Build the configure URL - only the fixed configureKey is sent
   const configureUrl = new URL("/admin/nodes/configure", options.panel);
   configureUrl.searchParams.append("configureKey", options.key);
 
   try {
-    // Call the panel - it will return the FULL config JSON (remote, key, port, ftp, proxy, ssl, etc.)
+    // Request the FULL config from the panel
     const fullConfig = await makeHttpRequest(configureUrl.toString(), "POST");
 
-    // Write the complete config received from the panel to config.json
+    // Overwrite config.json with the complete configuration received from the panel
     fs.writeFileSync(configPath, JSON.stringify(fullConfig, null, 2));
 
     console.log("✅ Node configured successfully!");
     console.log("📁 Full configuration saved to config.json");
-    console.log("\nCurrent config:");
+    console.log("\nCurrent config.json:");
     console.log(JSON.stringify(fullConfig, null, 2));
 
   } catch (error) {
     console.error("❌ Error configuring node:", error.message);
+    
     if (error.message.includes("Node not found") || error.message.includes("configureKey")) {
       console.error("\nMake sure you copied the correct configure key from the panel.");
     }
+    
     process.exit(1);
   }
 }
