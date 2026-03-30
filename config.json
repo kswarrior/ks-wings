@@ -16,6 +16,7 @@
   },
   "ssl": {
     "enabled": true,
+    "port": 443,
     "cert": "$HOME/.kspanel/database/wings/letsencrypt/live/kswings/fullchain.pem",
     "key": "$HOME/.kspanel/database/wings/letsencrypt/live/kswings/privkey.pem"
   },
