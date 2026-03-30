@@ -13,5 +13,11 @@
   "ftp": {
     "ip": "0.0.0.0",
     "port": 3003
-  }
+  },
+  "ssl": {
+    "enabled": true,
+    "cert": "$HOME/.kspanel/wings/letsencrypt/live/kswings/fullchain.pem",
+    "key": "$HOME/.kspanel/wings/letsencrypt/live/kswings/privkey.pem"
+  },
+  "proxy": true
 }
